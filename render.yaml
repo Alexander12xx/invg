@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: flower-smart-import
+    runtime: python
+    repo: https://github.com/yourusername/your-repo
+    plan: free
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: TESSERACT_CMD
+        value: /usr/bin/tesseract
+      - key: API_KEY
+        generateValue: true
