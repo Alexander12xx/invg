@@ -2,15 +2,17 @@ services:
   - type: web
     name: flower-smart-import
     runtime: python
-    repo: https://github.com/yourusername/your-repo
+    repo: https://github.com/Alexander12xx/invg
     plan: free
     region: oregon
-    buildCommand: pip install -r requirements.txt
+    buildCommand: |
+      apt-get update
+      apt-get install -y tesseract-ocr tesseract-ocr-eng build-essential
+      pip install --upgrade pip
+      pip install -r requirements.txt
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.0
+        value: 3.11.7
       - key: TESSERACT_CMD
         value: /usr/bin/tesseract
-      - key: API_KEY
-        generateValue: true
