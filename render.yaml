@@ -7,12 +7,14 @@ services:
     region: oregon
     buildCommand: |
       apt-get update
-      apt-get install -y tesseract-ocr tesseract-ocr-eng build-essential
+      apt-get install -y tesseract-ocr tesseract-ocr-eng build-essential libtesseract-dev
       pip install --upgrade pip
-      pip install -r requirements.txt
+      pip install --no-cache-dir -r requirements.txt
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.7
       - key: TESSERACT_CMD
         value: /usr/bin/tesseract
+      - key: TESSDATA_PREFIX
+        value: /usr/share/tesseract-ocr/4.00/tessdata
