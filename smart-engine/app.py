@@ -33,7 +33,7 @@ app = FastAPI(
     version="2.0.0"
 )
 
-# CORS Configuration - Allow InfinityFree to call this API
+# CORS Configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -41,7 +41,7 @@ app.add_middleware(
         "https://*.ct.ws",
         "https://*.infinityfree.com",
         "http://localhost:*",
-        "*"  # Remove this in production, use specific domains
+        "*"
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -105,12 +105,18 @@ def extract_text_from_excel(file_content: bytes) -> List[Dict]:
                     item['product_name'] = str(row[first_col]).strip()
             
             if 'boxes' in col_map and pd.notna(row[col_map['boxes']]):
-                item['boxes'] = int(row[col_map['boxes']]) if str(row[col_map['boxes']]).isdigit() else 1
+                try:
+                    item['boxes'] = int(row[col_map['boxes']])
+                except:
+                    item['boxes'] = 1
             else:
                 item['boxes'] = 1
                 
             if 'pack_rate' in col_map and pd.notna(row[col_map['pack_rate']]):
-                item['pack_rate'] = int(row[col_map['pack_rate']]) if str(row[col_map['pack_rate']]).isdigit() else 100
+                try:
+                    item['pack_rate'] = int(row[col_map['pack_rate']])
+                except:
+                    item['pack_rate'] = 100
             
             if 'price' in col_map and pd.notna(row[col_map['price']]):
                 try:
@@ -131,6 +137,9 @@ def extract_text_from_excel(file_content: bytes) -> List[Dict]:
                 # Calculate quantity if not provided
                 if 'quantity' not in item:
                     item['quantity'] = item.get('boxes', 1) * item.get('pack_rate', 100)
+                # Ensure pack_rate exists
+                if 'pack_rate' not in item:
+                    item['pack_rate'] = 100
                 items.append(item)
         
         return items
@@ -175,13 +184,21 @@ def extract_text_from_image(file_content: bytes) -> str:
         
         # Try Tesseract OCR
         try:
+            # Check if tesseract is available
+            import subprocess
+            try:
+                subprocess.run(['tesseract', '--version'], capture_output=True, check=True)
+            except:
+                logger.warning("Tesseract not available, skipping OCR")
+                return ""
+            
             text = pytesseract.image_to_string(image, lang='eng')
             if text.strip():
                 return text
-        except:
+        except Exception as e:
+            logger.warning(f"OCR failed: {e}")
             pass
         
-        # Fallback: return empty
         return ""
     except Exception as e:
         logger.error(f"Image OCR error: {e}")
@@ -203,10 +220,6 @@ def parse_order_text(text: str) -> List[Dict]:
                 continue
         
         item = {}
-        
-        # Try to extract product name (words before numbers or keywords)
-        # Pattern: Product name, maybe with specification, pack rate, boxes, price
-        # Example: "Hydrangea Pink 50cm packrate 60 3bxs price 1.65"
         
         # Extract length/size
         length_match = re.search(r'(\d+)\s*cm', line, re.IGNORECASE)
