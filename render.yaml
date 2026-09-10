@@ -1,7 +1,3 @@
-# render.yaml — Flower Smart Import Engine
-# Deploy config for Render.com (Docker runtime)
-# Designed and developed by ALTECH SOFTWARE DEVELOPERS
-
 services:
   - type: web
     name: flower-smart-import
@@ -16,11 +12,9 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.11"
+      - key: PYTHONUNBUFFERED
+        value: "1"
       - key: TESSERACT_CMD
         value: /usr/bin/tesseract
       - key: TESSDATA_PREFIX
         value: /usr/share/tesseract-ocr/4.00/tessdata
-      - key: API_KEY
-        sync: false
-      - key: PYTHONUNBUFFERED
-        value: "1"
