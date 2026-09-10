@@ -1,18 +1,17 @@
 """
-Smart Document Intelligence Engine v6.0
+Smart Document Intelligence Engine v6.1
 For invoices, quotations, proformas, receipts, delivery notes and flower/export
-orders. Designed to extract structured data from text, OCR images, PDFs, DOCX,
-Excel/CSV and JSON without silently inventing missing values.
+orders. Confidence-aware extraction from text, OCR images, PDFs, DOCX,
+Excel/CSV and JSON.
 
 Key principles:
-1. Never use defaults for missing boxes, pack rate, quantity or price.
+1. Never invent missing boxes, pack_rate, quantity or price.
 2. Keep boxes, pack_rate, quantity, unit_price and total as separate fields.
 3. Prefer explicit labels over positional guesses.
-4. Product names are cleaned only when a numeric token is confidently attached
-   to a known field.
-5. Ambiguous/unlabelled values are preserved in raw_values instead of being
-   put into the wrong field.
-6. Every item can carry confidence and source/provenance information.
+4. Ambiguous values are preserved in raw_values instead of misfiled.
+5. Every item carries confidence + validation warnings.
+
+ALTECH SOFTWARE DEVELOPERS
 """
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
@@ -26,7 +25,6 @@ import re
 import json
 import logging
 import math
-import mimetypes
 
 import pandas as pd
 import PyPDF2
@@ -35,7 +33,6 @@ from PIL import Image, ImageOps, ImageEnhance, ImageFilter
 import pytesseract
 from rapidfuzz import fuzz
 
-# Optional scanned-PDF OCR dependencies.
 try:
     import fitz  # PyMuPDF
 except Exception:
@@ -53,15 +50,17 @@ TESS_CMD = os.getenv("TESSERACT_CMD", "/usr/bin/tesseract")
 if os.path.exists(TESS_CMD):
     pytesseract.pytesseract.tesseract_cmd = TESS_CMD
 
+ENGINE_VERSION = "6.1.0"
+
 app = FastAPI(
     title="Smart Document Intelligence Engine",
-    version="6.0.0",
-    description="Confidence-aware document and flower-order extraction engine."
+    version=ENGINE_VERSION,
+    description="Confidence-aware document and flower-order extraction engine.",
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Restrict this in production to your frontend domain.
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -76,7 +75,47 @@ class MatchRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# FIELD KNOWLEDGE
+#  SAFE MATH HELPERS
+# ---------------------------------------------------------------------------
+
+def safe_int(x: Any) -> Any:
+    """Return int if x is a whole number; otherwise return x unchanged.
+    Handles int, float, None safely (never raises)."""
+    if x is None:
+        return None
+    if isinstance(x, bool):
+        return int(x)
+    if isinstance(x, int):
+        return x
+    if isinstance(x, float):
+        if math.isnan(x) or math.isinf(x):
+            return x
+        if x.is_integer():
+            return int(x)
+        return x
+    # Try coercion from string-like
+    try:
+        f = float(x)
+        return int(f) if f.is_integer() else f
+    except Exception:
+        return x
+
+
+def safe_sum(values) -> float:
+    """Sum safely; returns 0.0 for empty input."""
+    total = 0.0
+    for v in values:
+        if v is None:
+            continue
+        try:
+            total += float(v)
+        except Exception:
+            continue
+    return total
+
+
+# ---------------------------------------------------------------------------
+#  FIELD KNOWLEDGE
 # ---------------------------------------------------------------------------
 
 COLUMN_SYNONYMS = {
@@ -84,115 +123,114 @@ COLUMN_SYNONYMS = {
         "product", "product name", "product/service", "product / service",
         "product or service", "item", "item name", "service", "article",
         "articles", "commodity", "goods", "stock item", "particulars",
-        "product description", "item description", "name"
+        "product description", "item description",
     ],
     "variety": [
         "variety", "flower", "flower name", "flower type", "species",
-        "cultivar", "type", "kind", "variety name"
+        "cultivar", "kind", "variety name",
     ],
     "description": [
         "description", "desc", "details", "item details", "specification",
-        "specifications", "remarks", "product details", "item details"
+        "specifications", "remarks", "product details",
     ],
     "farm_code": [
-        "farm code", "farmcode", "farm reference", "farm ref", "supplier code",
-        "grower code", "grower reference", "code"
+        "farm code", "farmcode", "farm reference", "farm ref",
+        "supplier code", "grower code", "grower reference",
     ],
     "boxes": [
         "boxes", "box", "bx", "cartons", "carton", "ctn", "cases", "case",
-        "packs", "pack", "bundles", "bundle", "packages", "pkg",
+        "bundles", "bundle", "packages", "pkg",
         "number of boxes", "no. of boxes", "no boxes", "box qty",
-        "carton qty", "cartons qty"
+        "carton qty", "cartons qty",
     ],
     "pack_rate": [
         "packrate", "pack rate", "pack_rate", "per box", "per carton",
         "stems per box", "stems/box", "qty per box", "quantity per box",
         "stems per carton", "qty/carton", "quantity/carton",
-        "conversion rate", "pack rate per box"
+        "conversion rate", "pack rate per box",
     ],
     "quantity": [
         "quantity", "qty", "qnty", "stems", "pcs", "pieces", "count",
         "total quantity", "total qty", "number of stems", "stem quantity",
-        "invoice quantity", "qty invoice", "quantity invoice", "units"
+        "invoice quantity", "qty invoice", "quantity invoice",
     ],
     "unit_price": [
         "price", "price per stem", "price/stem", "unit price",
         "unit price (usd)", "unit price(usd)", "cost", "price per unit",
         "per stem", "per piece", "amount per stem", "unit cost",
-        "priceperstem", "rate per stem", "selling price", "unit selling price"
+        "priceperstem", "rate per stem", "selling price",
+        "unit selling price",
     ],
     "total": [
         "total", "total price", "total amount", "line total", "line amount",
-        "amount", "sub-total", "subtotal", "extended price", "total (usd)",
-        "total(usd)", "value", "line value"
+        "sub-total", "subtotal", "extended price", "total (usd)",
+        "total(usd)", "line value",
     ],
     "length": [
         "length", "length(cm)", "length (cm)", "size", "size(cm)",
-        "stem length", "height", "cm", "stem size", "length cm"
+        "stem length", "height", "stem size", "length cm",
     ],
-    "discount": ["discount", "disc.", "disc", "rebate"],
+    "discount": ["discount", "disc.", "rebate"],
     "tax": ["tax", "vat", "gst", "sales tax"],
 }
 
 META_LABELS = {
     "invoice_number": [
         "invoice number", "invoice no", "invoice #", "invoice no.", "inv no",
-        "inv #", "invoice", "quotation number", "quotation no", "quote number",
+        "inv #", "quotation number", "quotation no", "quote number",
         "proforma number", "proforma no", "document number", "doc no",
-        "reference", "ref", "ref no", "reference number", "document ref"
+        "reference", "ref no", "reference number", "document ref",
     ],
     "date": [
         "date", "date of shipment", "shipment date", "invoice date",
-        "issue date", "document date", "quotation date"
+        "issue date", "document date", "quotation date",
     ],
     "due_date": [
         "due date", "payment due", "valid until", "valid till", "expiry",
-        "expires", "expiration"
+        "expires", "expiration",
     ],
     "currency": ["currency", "currency code", "ccy"],
     "vat_rate": ["vat rate", "vat rate (%)", "tax rate", "tax %", "vat %"],
     "country_destination": [
         "country of destination", "destination country", "destination",
-        "country dest", "ship to country", "country destination"
+        "country dest", "ship to country", "country destination",
     ],
     "point_of_entry": [
         "point of entry", "port of entry", "entry point", "port", "airport",
-        "arrival port"
+        "arrival port",
     ],
-    "country_origin": [
-        "country of origin", "origin", "origin country"
-    ],
+    "country_origin": ["country of origin", "origin country"],
     "consignee_name": [
-        "consignee name", "consignee", "bill to", "ship to", "customer name",
-        "client name", "buyer name", "customer", "consignee details"
+        "consignee name", "consignee", "bill to", "ship to",
+        "customer name", "client name", "buyer name", "consignee details",
     ],
     "consignee_address": [
         "consignee address", "bill to address", "ship to address",
-        "customer address", "buyer address", "delivery address"
+        "customer address", "buyer address", "delivery address",
     ],
     "seller_name": [
         "seller name", "seller", "vendor", "supplier", "exporter",
-        "seller / exporter", "exporter name"
+        "seller / exporter", "exporter name",
     ],
     "purchase_order_no": [
         "purchase order no", "purchase order #", "purchase order number",
         "purchase order", "po no", "po #", "po number", "customer po",
-        "order number", "purchase order no."
+        "order number", "purchase order no.",
     ],
     "payment_terms": [
-        "payment terms", "payment term", "terms of payment", "payment"
+        "payment terms", "payment term", "terms of payment", "payment",
     ],
     "transportation": [
         "transportation", "transport", "shipment method",
-        "mode of transport", "shipping method", "transportation details"
+        "mode of transport", "shipping method", "transportation details",
     ],
     "awb_number": [
         "awb number", "awb no", "awb", "air waybill", "tracking number",
-        "waybill", "airway bill"
+        "waybill", "airway bill",
     ],
     "net_weight": [
         "net weight", "net weight (kgs)", "net weight (kg)", "net kg",
-        "net weight kgs"
+        "net weight kgs",
     ],
     "notes": ["notes", "note", "comments", "comment", "remarks"],
 }
@@ -204,40 +242,38 @@ DOC_TYPES = {
     "receipt": ["receipt", "payment receipt"],
     "delivery_note": ["delivery note", "delivery", "dispatch note"],
     "credit_note": ["credit note", "credit memo"],
-    "purchase_order": ["purchase order", "purchase order form", "po"],
+    "purchase_order": ["purchase order", "purchase order form"],
 }
 
 CURRENCY_WORDS = {
     "usd": "USD", "us dollar": "USD", "dollar": "USD",
     "kes": "KES", "ksh": "KES", "kenya shilling": "KES",
     "eur": "EUR", "euro": "EUR", "gbp": "GBP", "pound": "GBP",
-    "aed": "AED", "sar": "SAR", "qar": "QAR"
+    "aed": "AED", "sar": "SAR", "qar": "QAR",
 }
 
-# Field-specific label patterns. Longest/more specific labels are tested first.
 FIELD_PATTERNS = {
     "boxes": r"(?:no\.?\s*of\s*)?(?:boxes?|bx|cartons?|ctn|cases?|bundles?|packages?)",
     "pack_rate": r"(?:pack\s*rate|packrate|stems?\s*(?:per|/)\s*(?:box|carton)|qty\s*(?:per|/)\s*(?:box|carton)|quantity\s*(?:per|/)\s*(?:box|carton))",
     "quantity": r"(?:quantity|qty|qnty|total\s+qty|total\s+quantity|invoice\s+qty|invoice\s+quantity|stems?|pieces?|pcs|units?)",
     "unit_price": r"(?:price\s*(?:per|/)\s*(?:stem|piece|unit)|price\s*per\s*stem|price/stem|unit\s*price|unit\s*cost|rate\s*per\s*stem|selling\s*price|cost\s*per\s*unit)",
-    "total": r"(?:line\s+total|total\s+amount|total\s+price|line\s+amount|extended\s+price|amount|total)",
+    "total": r"(?:line\s+total|total\s+amount|total\s+price|line\s+amount|extended\s+price|amount)",
     "length": r"(?:length(?:\s*\(?(?:cm|cms)\)?)?|stem\s+length|size)\b",
     "farm_code": r"(?:farm\s*code|farm\s*ref(?:erence)?|grower\s*code|supplier\s*code)",
 }
 
+
 # ---------------------------------------------------------------------------
-# SAFE NORMALIZATION / NUMBERS
+#  NORMALIZATION / NUMBERS
 # ---------------------------------------------------------------------------
 
 def norm(s: Any) -> str:
     s = "" if s is None else str(s)
     s = s.replace("–", "-").replace("—", "-").replace("’", "'")
-    s = re.sub(r"\s+", " ", s.strip().lower())
-    return s
+    return re.sub(r"\s+", " ", s.strip().lower())
 
 
 def clean_ocr_text(text: str) -> str:
-    """Correct common OCR spacing mistakes without changing values."""
     text = text.replace("\x00", "")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\s+\|", " |", text)
@@ -246,22 +282,26 @@ def clean_ocr_text(text: str) -> str:
 
 
 def parse_number(value: Any) -> Optional[float]:
-    if value is None or (isinstance(value, float) and math.isnan(value)):
+    if value is None:
+        return None
+    if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
+        if isinstance(value, float) and math.isnan(value):
+            return None
         return float(value)
 
     txt = str(value).strip()
     if not txt:
         return None
 
-    # Keep minus and decimal separators, remove currency/unit text.
     txt = re.sub(r"(?i)\b(?:usd|us\$|kes|ksh|eur|gbp|aed|sar|qar)\b", "", txt)
     txt = txt.replace("$", "").replace("€", "").replace("£", "")
     txt = re.sub(r"(?<=\d)\s+(?=\d)", "", txt)
     txt = txt.strip()
+    if not txt:
+        return None
 
-    # 1,250.50 / 1.250,50 / 1250.50 / 1250,50
     if "," in txt and "." in txt:
         if txt.rfind(",") > txt.rfind("."):
             txt = txt.replace(".", "").replace(",", ".")
@@ -289,13 +329,14 @@ def as_number(value: Any) -> Optional[float]:
 
 
 def empty_field(value: Any) -> bool:
-    return value is None or str(value).strip() == "" or str(value).strip().lower() in {
-        "n/a", "na", "null", "none", "-", "—"
-    }
+    if value is None:
+        return True
+    s = str(value).strip().lower()
+    return s == "" or s in {"n/a", "na", "null", "none", "-", "—"}
 
 
 # ---------------------------------------------------------------------------
-# LABEL MATCHING
+#  LABEL MATCHING
 # ---------------------------------------------------------------------------
 
 def match_header(label: str) -> Optional[str]:
@@ -304,15 +345,13 @@ def match_header(label: str) -> Optional[str]:
     if not l:
         return None
 
-    # Exact matches first.
     for field, names in COLUMN_SYNONYMS.items():
         if l in {norm(x) for x in names}:
             return field
 
-    # Fuzzy/partial matches, with dangerous generic labels handled carefully.
     priority = [
         "pack_rate", "unit_price", "farm_code", "quantity", "boxes",
-        "length", "total", "product", "variety", "description"
+        "length", "total", "product", "variety", "description",
     ]
     for field in priority:
         for n in COLUMN_SYNONYMS[field]:
@@ -320,7 +359,6 @@ def match_header(label: str) -> Optional[str]:
             if len(nn) >= 5 and (nn in l or l in nn):
                 return field
 
-    # Fuzzy only for reasonably strong matches.
     best_field, best_score = None, 0
     for field, names in COLUMN_SYNONYMS.items():
         for n in names:
@@ -352,7 +390,7 @@ def match_meta_label(label: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# DOCUMENT CLASSIFICATION / METADATA
+#  DOCUMENT CLASSIFICATION / METADATA
 # ---------------------------------------------------------------------------
 
 def detect_document_type(text: str) -> Optional[str]:
@@ -371,11 +409,10 @@ def extract_meta_from_text(text: str) -> Dict[str, Any]:
     lines = [x.strip() for x in clean_ocr_text(text).splitlines() if x.strip()]
 
     for i, line in enumerate(lines):
-        # Label: value / Label - value / Label | value
         m = re.match(
             r"^\s*([A-Za-z][A-Za-z0-9\s./()%#*&_-]{1,70}?)\s*"
             r"(?:[:#]\s*|-\s+|\|\s*)(.*?)\s*$",
-            line
+            line,
         )
         if m:
             label, value = m.group(1), m.group(2).strip()
@@ -384,7 +421,6 @@ def extract_meta_from_text(text: str) -> Dict[str, Any]:
                 meta[field] = value
                 continue
 
-        # OCR/forms frequently put label on one line and value on next line.
         field = match_meta_label(line.rstrip(":#"))
         if field and i + 1 < len(lines):
             nxt = lines[i + 1]
@@ -392,7 +428,6 @@ def extract_meta_from_text(text: str) -> Dict[str, Any]:
                 if field not in meta:
                     meta[field] = nxt
 
-    # Currency can appear as "USD - US Dollar".
     if "currency" in meta:
         c = norm(meta["currency"])
         for word, code in CURRENCY_WORDS.items():
@@ -405,7 +440,7 @@ def extract_meta_from_text(text: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# PRODUCT SAFETY
+#  PRODUCT SAFETY
 # ---------------------------------------------------------------------------
 
 NON_PRODUCT_TERMS = {
@@ -417,7 +452,8 @@ NON_PRODUCT_TERMS = {
     "price", "price per stem", "unit price", "total", "amount",
     "boxes", "packrate", "pack rate", "farm code", "length",
     "country of destination", "country of origin", "point of entry",
-    "date of shipment", "currency", "purchase order", "purchase order #"
+    "date of shipment", "currency", "purchase order", "purchase order #",
+    "subtotal", "grand total", "vat", "tax",
 }
 
 COMPANY_TERMS = re.compile(
@@ -448,7 +484,6 @@ def looks_like_product(name: str) -> bool:
     ):
         return False
 
-    # A pure numeric/code string is not a product.
     if not re.search(r"[A-Za-z]{3,}", n):
         return False
     return True
@@ -475,14 +510,10 @@ def is_header_or_metadata(line: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# FIELD EXTRACTION FROM FREE-FORM LINES
+#  FREE-FORM LINE PARSING
 # ---------------------------------------------------------------------------
 
 def extract_labeled_fields(line: str) -> Dict[str, Any]:
-    """
-    Extract explicitly labelled values from a line. Crucially, a number is not
-    assigned to quantity/price/boxes unless its label identifies the field.
-    """
     result: Dict[str, Any] = {}
 
     patterns = [
@@ -498,20 +529,19 @@ def extract_labeled_fields(line: str) -> Dict[str, Any]:
     for field, label_pat in patterns:
         m = re.search(
             rf"\b{label_pat}\b\s*(?:[:=]\s*|\s+)([^|,;]+)",
-            line, re.I
+            line, re.I,
         )
         if not m:
             continue
 
         raw = m.group(1).strip()
-        # Stop a captured value if another known label follows it.
         next_labels = re.search(
             r"\s+(?:pack\s*rate|packrate|qty|quantity|boxes?|cartons?|"
             r"price|unit\s*price|total|farm\s*code|length)\b",
-            raw, re.I
+            raw, re.I,
         )
         if next_labels:
-            raw = raw[:next_labels.start()].strip()
+            raw = raw[: next_labels.start()].strip()
 
         if field in {"boxes", "pack_rate", "quantity", "unit_price", "total"}:
             value = parse_number(raw)
@@ -520,20 +550,17 @@ def extract_labeled_fields(line: str) -> Dict[str, Any]:
         elif field == "length":
             lm = re.search(r"\d+(?:\.\d+)?", raw)
             if lm:
-                result["specification"] = {
-                    "length": f"{lm.group(0)}cm"
-                }
+                result["specification"] = {"length": f"{lm.group(0)}cm"}
         elif field == "farm_code":
-            result["farm_code"] = raw.split()[0]
+            parts = raw.split()
+            if parts:
+                result["farm_code"] = parts[0]
 
     return result
 
 
 def strip_known_annotations(name: str) -> str:
-    """Remove only tokens that were explicitly recognizable as field data."""
     s = name
-
-    # Remove explicit field phrases and their immediate values.
     patterns = [
         r"\bpack\s*rate\b\s*[:=]?\s*[\d,.]+",
         r"\bpackrate\b\s*[:=]?\s*[\d,.]+",
@@ -546,27 +573,18 @@ def strip_known_annotations(name: str) -> str:
     for pat in patterns:
         s = re.sub(pat, " ", s, flags=re.I)
 
-    # Remove currency symbols/standalone currency words only when adjacent to
-    # an already recognized numeric token; do not destroy product names.
     s = re.sub(r"(?i)(?<=\d)\s*(?:usd|us\$|kes|ksh|eur|gbp|aed|sar|qar)\b", " ", s)
     s = re.sub(r"\s+", " ", s).strip(" -:,;.|")
     return s
 
 
 def parse_inline_line(line: str) -> Optional[Dict[str, Any]]:
-    """
-    Handles examples such as:
-      Roses Red 70cm | 2 boxes | pack rate 100 | qty 200 | price/stem 0.40
-      Alstroemeria Pink qty 200 price 0.40
-    Unlabelled numbers are not automatically promoted to financial fields.
-    """
     s = line.strip()
     if not s or is_header_or_metadata(s):
         return None
 
     fields = extract_labeled_fields(s)
 
-    # A bare "100 boxes" or "2 boxes" is safely recognized.
     if "boxes" not in fields:
         m = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:boxes?|bx|cartons?|ctn)\b", s, re.I)
         if m:
@@ -579,17 +597,14 @@ def parse_inline_line(line: str) -> Optional[Dict[str, Any]]:
 
     name = strip_known_annotations(s)
 
-    # Remove standalone numbers only if they are attached to an explicit
-    # recognizable field; never strip arbitrary numbers from a product name.
     if fields:
         name = re.sub(
             r"\b(?:boxes?|bx|cartons?|ctn|qty|quantity|qnty|pack\s*rate|"
             r"packrate|price|rate|total|amount|length)\b",
-            " ", name, flags=re.I
+            " ", name, flags=re.I,
         )
         name = re.sub(r"\s+", " ", name).strip(" -:,;.|")
 
-    # If the line is just a collection of values, reject it.
     if not looks_like_product(name):
         return None
 
@@ -604,16 +619,14 @@ def parse_inline_line(line: str) -> Optional[Dict[str, Any]]:
     }
     if fields.get("farm_code"):
         item["farm_code"] = fields["farm_code"]
-
     return item
 
 
 # ---------------------------------------------------------------------------
-# TABLE PARSING
+#  TABLE PARSING
 # ---------------------------------------------------------------------------
 
 def split_columns(line: str) -> List[str]:
-    # Prefer pipe/tab separators. Then OCR-created 2+ spaces.
     if "|" in line:
         parts = [x.strip() for x in re.split(r"\s*\|\s*", line)]
     elif "\t" in line:
@@ -632,8 +645,6 @@ def find_table_header(lines: List[str]) -> Tuple[Optional[int], List[Optional[st
         mapped = [match_header(c) for c in cols]
         known = [m for m in mapped if m]
 
-        # Strong header if it has a product-like field and at least one
-        # measurable/financial field.
         if (
             len(known) >= 2
             and any(x in known for x in ("product", "variety", "description"))
@@ -667,7 +678,6 @@ def parse_table_row(line: str, headers: List[Optional[str]]) -> Optional[Dict[st
 
     for i, cell in enumerate(cols):
         if i >= len(headers):
-            # Preserve extra OCR columns instead of silently shifting data.
             raw_values[f"unmapped_{i+1}"] = cell
             continue
         field = headers[i]
@@ -686,8 +696,6 @@ def parse_table_row(line: str, headers: List[Optional[str]]) -> Optional[Dict[st
             break
 
     if not name:
-        # Conservative fallback: only choose a cell that is clearly a
-        # textual product and is not a known metadata/header field.
         for cell in cols:
             if looks_like_product(cell) and not is_header_or_metadata(cell):
                 name = cell
@@ -717,7 +725,7 @@ def parse_table_row(line: str, headers: List[Optional[str]]) -> Optional[Dict[st
 
 
 # ---------------------------------------------------------------------------
-# TEXT ENGINE
+#  TEXT ENGINE
 # ---------------------------------------------------------------------------
 
 def parse_order_text(text: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
@@ -735,18 +743,14 @@ def parse_order_text(text: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
             if item:
                 items.append(item)
 
-        # If a table exists, do not mix unrelated metadata lines into items.
         if items:
             return clean_items(items), meta
 
-    # Some pasted/OCR forms are "label value" sequences. We group lines
-    # conservatively only when a line clearly contains product text.
     for line in lines:
         s = line.strip()
         if not s or len(s) < 3 or is_header_or_metadata(s):
             continue
 
-        # Skip obvious metadata key:value lines.
         if re.match(r"^[A-Za-z][A-Za-z0-9\s./()%#*&_-]{1,70}\s*[:#]", s):
             if match_meta_label(re.split(r"[:#]", s, 1)[0]):
                 continue
@@ -759,7 +763,7 @@ def parse_order_text(text: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# EXCEL / CSV
+#  EXCEL / CSV
 # ---------------------------------------------------------------------------
 
 def find_excel_header(df: pd.DataFrame) -> Tuple[Optional[int], Dict[int, str]]:
@@ -793,7 +797,6 @@ def extract_from_dataframe(df: pd.DataFrame) -> Tuple[List[Dict[str, Any]], Dict
 
     header_row, header_map = find_excel_header(df)
     if header_row is None:
-        # Try first row as header only if it contains known labels.
         header_row = -1
         header_map = {0: "product"}
 
@@ -858,14 +861,10 @@ def extract_from_excel(content: bytes, ext: str) -> Tuple[List[Dict[str, Any]], 
 
 
 # ---------------------------------------------------------------------------
-# DOCUMENT EXTRACTION
+#  DOCUMENT EXTRACTION
 # ---------------------------------------------------------------------------
 
 def extract_text_from_pdf(content: bytes) -> Tuple[str, str]:
-    """
-    Returns (text, extraction_method). First uses the embedded PDF text.
-    If it is empty/too short, optionally OCRs rendered pages using PyMuPDF.
-    """
     text_parts = []
     try:
         reader = PyPDF2.PdfReader(io.BytesIO(content))
@@ -917,7 +916,6 @@ def extract_text_from_docx(content: bytes) -> str:
 
 def preprocess_image(img: Image.Image) -> Image.Image:
     img = img.convert("RGB")
-    # Upscaling substantially improves OCR for small invoice tables.
     w, h = img.size
     if max(w, h) < 1800:
         scale = min(2.5, 1800 / max(w, h))
@@ -932,11 +930,7 @@ def preprocess_image(img: Image.Image) -> Image.Image:
 
 def ocr_image(img: Image.Image) -> str:
     processed = preprocess_image(img)
-    configs = [
-        "--oem 3 --psm 6",
-        "--oem 3 --psm 11",
-        "--oem 3 --psm 4",
-    ]
+    configs = ["--oem 3 --psm 6", "--oem 3 --psm 11", "--oem 3 --psm 4"]
     results = []
     for cfg in configs:
         try:
@@ -948,8 +942,6 @@ def ocr_image(img: Image.Image) -> str:
 
     if not results:
         return ""
-
-    # Pick the OCR result with the most useful alphanumeric content.
     return max(results, key=lambda x: len(re.findall(r"[A-Za-z0-9]", x)))
 
 
@@ -971,7 +963,7 @@ def extract_text_from_json(content: bytes) -> Tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# NORMALIZATION / VALIDATION
+#  VALIDATION / CLEANING
 # ---------------------------------------------------------------------------
 
 def validate_item(item: Dict[str, Any]) -> List[str]:
@@ -993,25 +985,27 @@ def validate_item(item: Dict[str, Any]) -> List[str]:
     if t is not None and t < 0:
         warnings.append("total_negative")
 
-    # Only validate mathematical relationships when all required fields exist.
     if q is not None and u is not None and t is not None:
-        expected = float(q) * float(u)
-        if abs(expected - float(t)) > max(0.02, abs(float(t)) * 0.01):
-            warnings.append("quantity_x_unit_price_does_not_match_total")
+        try:
+            expected = float(q) * float(u)
+            if abs(expected - float(t)) > max(0.02, abs(float(t)) * 0.01):
+                warnings.append("quantity_x_unit_price_does_not_match_total")
+        except Exception:
+            pass
 
     if b is not None and p is not None and q is not None:
-        expected_q = float(b) * float(p)
-        if abs(expected_q - float(q)) > 0.5:
-            warnings.append("boxes_x_pack_rate_does_not_match_quantity")
+        try:
+            expected_q = float(b) * float(p)
+            if abs(expected_q - float(q)) > 0.5:
+                warnings.append("boxes_x_pack_rate_does_not_match_quantity")
+        except Exception:
+            pass
 
     return warnings
 
 
 def clean_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    IMPORTANT: Missing values remain None. This intentionally replaces the
-    old engine's defaults such as boxes=1, pack_rate=100 and unit_price=0.
-    """
+    """Missing values remain None. Nothing invented."""
     cleaned = []
 
     for raw in items:
@@ -1042,16 +1036,19 @@ def clean_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if raw.get("raw_values"):
             out["raw_values"] = raw["raw_values"]
 
-        # Calculate ONLY when the calculation is unambiguous.
-        # Never invent a missing source value.
+        # Safe derivation only when unambiguous
         if out["quantity"] is None and out["boxes"] is not None and out["pack_rate"] is not None:
-            out["quantity"] = as_number(float(out["boxes"]) * float(out["pack_rate"]))
+            try:
+                out["quantity"] = as_number(float(out["boxes"]) * float(out["pack_rate"]))
+            except Exception:
+                pass
 
         if out["total"] is None and out["quantity"] is not None and out["unit_price"] is not None:
-            out["total"] = round(float(out["quantity"]) * float(out["unit_price"]), 4)
+            try:
+                out["total"] = round(float(out["quantity"]) * float(out["unit_price"]), 4)
+            except Exception:
+                pass
 
-        # Confidence starts high for explicit product identification and is
-        # reduced by missing/ambiguous relationships.
         confidence = 0.95
         if out["product_name"]:
             confidence += 0.02
@@ -1079,7 +1076,7 @@ def clean_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# PRODUCT MATCHING
+#  PRODUCT MATCHING
 # ---------------------------------------------------------------------------
 
 def normalize_product_for_match(name: str) -> str:
@@ -1096,7 +1093,6 @@ async def match_products_endpoint(req: MatchRequest):
             return {"success": True, "items": req.items, "matched_count": 0}
 
         out = []
-
         for item in req.items:
             iname = normalize_product_for_match(str(item.get("product_name", "")))
             best = None
@@ -1121,7 +1117,6 @@ async def match_products_endpoint(req: MatchRequest):
                         best_score = score
                         best = product
 
-            # Never silently replace a weak match.
             confidence = best_score / 100.0
             if best is not None and confidence >= MIN_MATCH_CONFIDENCE:
                 out.append({
@@ -1129,14 +1124,14 @@ async def match_products_endpoint(req: MatchRequest):
                     "product_id": best.get("id"),
                     "matched_product_name": best.get("name"),
                     "match_confidence": round(confidence, 3),
-                    "match_status": "matched"
+                    "match_status": "matched",
                 })
             else:
                 out.append({
                     **item,
                     "product_id": None,
                     "match_confidence": round(confidence, 3),
-                    "match_status": "review_required"
+                    "match_status": "review_required",
                 })
 
         return {
@@ -1151,28 +1146,28 @@ async def match_products_endpoint(req: MatchRequest):
 
 
 # ---------------------------------------------------------------------------
-# MAIN ANALYSIS ENDPOINT
+#  ENDPOINTS
 # ---------------------------------------------------------------------------
 
 @app.get("/")
 async def root():
     return {
         "service": "Smart Document Intelligence Engine",
-        "version": "6.0.0",
+        "version": ENGINE_VERSION,
         "status": "operational",
         "capabilities": [
             "invoice", "quotation", "proforma", "receipt", "delivery_note",
             "purchase_order", "images_ocr", "scanned_pdf_ocr",
             "pdf_text", "docx", "xlsx", "xls", "xlsm", "csv", "json", "text",
             "confidence_scoring", "validation", "provenance",
-            "safe_blank_fields", "product_matching"
+            "safe_blank_fields", "product_matching",
         ],
         "endpoints": [
             "/api/health",
             "/api/analyze (POST)",
             "/api/match-products (POST)",
-            "/api/extract-text (POST)"
-        ]
+            "/api/extract-text (POST)",
+        ],
     }
 
 
@@ -1181,7 +1176,7 @@ async def health():
     return {
         "status": "healthy",
         "service": "smart-import-engine",
-        "version": "6.0.0",
+        "version": ENGINE_VERSION,
         "ocr_available": bool(pytesseract),
         "scanned_pdf_ocr_available": fitz is not None,
     }
@@ -1198,7 +1193,7 @@ async def analyze(
         if len(content) > MAX_UPLOAD_MB * 1024 * 1024:
             raise HTTPException(
                 status_code=413,
-                detail=f"File is larger than {MAX_UPLOAD_MB} MB."
+                detail=f"File is larger than {MAX_UPLOAD_MB} MB.",
             )
 
         fname = file.filename or "upload"
@@ -1206,7 +1201,7 @@ async def analyze(
 
         logger.info(
             "Processing %s (%s), company=%s, size=%s",
-            fname, ext, company_id, len(content)
+            fname, ext, company_id, len(content),
         )
 
         items: List[Dict[str, Any]] = []
@@ -1242,18 +1237,17 @@ async def analyze(
 
         cleaned = clean_items(items)
 
-        # Metadata can also come from spreadsheet labels when the sheet is
-        # actually a form; parse text if there is no table result.
         if text_extracted and not metadata:
             metadata = extract_meta_from_text(text_extracted)
 
-        total_boxes = sum(float(x["boxes"]) for x in cleaned if x["boxes"] is not None)
-        total_quantity = sum(float(x["quantity"]) for x in cleaned if x["quantity"] is not None)
-        total_amount = sum(float(x["total"]) for x in cleaned if x["total"] is not None)
+        # ---- SAFE TOTALS (fixed bug) ----
+        total_boxes_f = safe_sum(x.get("boxes") for x in cleaned)
+        total_qty_f = safe_sum(x.get("quantity") for x in cleaned)
+        total_amount_f = safe_sum(x.get("total") for x in cleaned)
 
-        # Convert integer-looking aggregate numbers back to integers.
-        total_boxes = int(total_boxes) if total_boxes.is_integer() else total_boxes
-        total_quantity = int(total_quantity) if total_quantity.is_integer() else total_quantity
+        total_boxes = safe_int(total_boxes_f)
+        total_quantity = safe_int(total_qty_f)
+        total_amount = round(float(total_amount_f), 2)
 
         warnings = []
         for x in cleaned:
@@ -1266,7 +1260,7 @@ async def analyze(
             "document_type": metadata.get("document_type"),
             "total_boxes": total_boxes,
             "total_quantity": total_quantity,
-            "total_amount": round(total_amount, 2),
+            "total_amount": total_amount,
             "item_count": len(cleaned),
             "review_required": any(
                 x.get("confidence", 0) < 0.80 or x.get("warnings")
@@ -1277,7 +1271,7 @@ async def analyze(
             "extraction_method": extraction_method,
             "file_type": ext,
             "filename": fname,
-            "engine_version": "6.0.0",
+            "engine_version": ENGINE_VERSION,
         }
 
     except HTTPException:
