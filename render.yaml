@@ -1,20 +1,26 @@
+# render.yaml — Flower Smart Import Engine
+# Deploy config for Render.com (Docker runtime)
+# Designed and developed by ALTECH SOFTWARE DEVELOPERS
+
 services:
   - type: web
     name: flower-smart-import
-    runtime: python
-    repo: https://github.com/Alexander12xx/invg
+    runtime: docker
     plan: free
     region: oregon
-    buildCommand: |
-      apt-get update
-      apt-get install -y tesseract-ocr tesseract-ocr-eng build-essential libtesseract-dev
-      pip install --upgrade pip
-      pip install --no-cache-dir -r requirements.txt
-    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    branch: main
+    autoDeploy: true
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.7
+        value: "3.11"
       - key: TESSERACT_CMD
         value: /usr/bin/tesseract
       - key: TESSDATA_PREFIX
         value: /usr/share/tesseract-ocr/4.00/tessdata
+      - key: API_KEY
+        sync: false
+      - key: PYTHONUNBUFFERED
+        value: "1"
