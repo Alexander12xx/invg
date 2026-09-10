@@ -1,30 +1,33 @@
 """
-Smart Document Intelligence Engine v6.1
-For invoices, quotations, proformas, receipts, delivery notes and flower/export
-orders. Confidence-aware extraction from text, OCR images, PDFs, DOCX,
-Excel/CSV and JSON.
+Smart Document Intelligence Engine v7.0
+AI-style analysis for invoices, quotations, proformas, receipts, delivery notes,
+packing lists, purchase orders and flower/export orders.
 
-Key principles:
-1. Never invent missing boxes, pack_rate, quantity or price.
+Core principles (unchanged + extended):
+1. Never invent boxes, pack_rate, quantity or price.
 2. Keep boxes, pack_rate, quantity, unit_price and total as separate fields.
 3. Prefer explicit labels over positional guesses.
-4. Ambiguous values are preserved in raw_values instead of misfiled.
-5. Every item carries confidence + validation warnings.
+4. Ambiguous values are quarantined in raw_values, not misfiled.
+5. Every item carries confidence + validation warnings + reasoning.
+6. NEW: Prices can NEVER leak into product_name / variety / description.
+7. NEW: AI-style insights, anomalies, severity and recommendations envelope.
 
 ALTECH SOFTWARE DEVELOPERS
 """
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 import io
 import os
 import re
 import json
-import logging
 import math
+import logging
+import statistics
+from datetime import datetime
 
 import pandas as pd
 import PyPDF2
@@ -50,12 +53,12 @@ TESS_CMD = os.getenv("TESSERACT_CMD", "/usr/bin/tesseract")
 if os.path.exists(TESS_CMD):
     pytesseract.pytesseract.tesseract_cmd = TESS_CMD
 
-ENGINE_VERSION = "6.1.0"
+ENGINE_VERSION = "7.0.0"
 
 app = FastAPI(
     title="Smart Document Intelligence Engine",
     version=ENGINE_VERSION,
-    description="Confidence-aware document and flower-order extraction engine.",
+    description="AI-style, confidence-aware document and flower-order extraction engine.",
 )
 
 app.add_middleware(
@@ -69,18 +72,128 @@ MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "25"))
 MIN_MATCH_CONFIDENCE = float(os.getenv("MIN_MATCH_CONFIDENCE", "0.60"))
 
 
+# ===========================================================================
+#  PYDANTIC SCHEMA — STRICT ROUTING (from prices.txt)
+# ===========================================================================
+
+PRICE_PATTERN = re.compile(
+    r"(?:\$|€|£|KES|KSH|USD|EUR|GBP|AED|SAR|QAR)?\s*"
+    r"\b\d+(?:[\.,]\d{1,4})?\b\s*"
+    r"(?:USD|KES|EUR|GBP|AED|SAR|QAR)?",
+    re.IGNORECASE,
+)
+
+CURRENCY_SYMBOLS = re.compile(
+    r"[\$€£]|(?:\b(?:USD|KES|KSH|EUR|GBP|AED|SAR|QAR)\b)",
+    re.IGNORECASE,
+)
+
+PRICE_LABEL_WORDS = re.compile(
+    r"\b(?:price|rate|cost|total|amount|subtotal|value|unit\s*price|"
+    r"price\s*/?\s*stem|per\s*stem)\b",
+    re.IGNORECASE,
+)
+
+
+class ExtractedLineItem(BaseModel):
+    """Strictly typed line item. Prices cannot pollute text fields."""
+    product_name: str = Field(..., min_length=1)
+    variety: Optional[str] = None
+    farm_code: Optional[str] = None
+    boxes: Optional[float] = None
+    pack_rate: Optional[float] = None
+    quantity: Optional[float] = None
+    unit_price: Optional[float] = None
+    total: Optional[float] = None
+    specification: Dict[str, Any] = Field(default_factory=dict)
+    raw_values: Dict[str, Any] = Field(default_factory=dict)
+    confidence: float = Field(0.5, ge=0.0, le=1.0)
+    validation_warnings: List[str] = Field(default_factory=list)
+
+    @field_validator("product_name", "variety", mode="before")
+    @classmethod
+    def strip_prices_from_text(cls, value, info):
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+
+        # Strip if it contains currency symbol, currency code, or price labels
+        if CURRENCY_SYMBOLS.search(text) or PRICE_LABEL_WORDS.search(text):
+            cleaned = PRICE_PATTERN.sub(" ", text)
+            cleaned = re.sub(r"\s+", " ", cleaned).strip(" -:,;.|")
+            return cleaned if len(cleaned) >= 2 else "UNKNOWN_ITEM"
+        return text
+
+    @field_validator("boxes", "pack_rate", "quantity", mode="before")
+    @classmethod
+    def to_optional_number(cls, value):
+        if value is None or value == "":
+            return None
+        try:
+            f = float(value)
+            return int(f) if f.is_integer() else f
+        except (ValueError, TypeError):
+            return None
+
+    @field_validator("unit_price", "total", mode="before")
+    @classmethod
+    def to_optional_float(cls, value):
+        if value is None or value == "":
+            return None
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return None
+
+    @model_validator(mode="after")
+    def reconcile_and_route(self):
+        # Route quarantined unmapped prices
+        if self.unit_price is None and "unmapped_price" in self.raw_values:
+            try:
+                self.unit_price = float(self.raw_values["unmapped_price"])
+            except (ValueError, TypeError):
+                pass
+
+        warnings = list(self.validation_warnings)
+
+        # Arithmetic reconciliation
+        if self.quantity and self.unit_price and self.total:
+            expected = self.quantity * self.unit_price
+            if abs(expected - self.total) > max(0.02, abs(self.total) * 0.01):
+                warnings.append("quantity_x_unit_price_does_not_match_total")
+
+        if self.boxes and self.pack_rate and self.quantity:
+            expected = self.boxes * self.pack_rate
+            if abs(expected - self.quantity) > 0.5:
+                warnings.append("boxes_x_pack_rate_does_not_match_quantity")
+
+        self.validation_warnings = sorted(set(warnings))
+        return self
+
+
+class DocumentPayload(BaseModel):
+    document_type: str = "unknown"
+    invoice_number: Optional[str] = None
+    date: Optional[str] = None
+    due_date: Optional[str] = None
+    consignee_name: Optional[str] = None
+    seller_name: Optional[str] = None
+    currency: str = "USD"
+    items: List[ExtractedLineItem] = Field(default_factory=list)
+
+
 class MatchRequest(BaseModel):
     items: List[Dict[str, Any]]
     company_products: List[Dict[str, Any]]
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 #  SAFE MATH HELPERS
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 def safe_int(x: Any) -> Any:
-    """Return int if x is a whole number; otherwise return x unchanged.
-    Handles int, float, None safely (never raises)."""
     if x is None:
         return None
     if isinstance(x, bool):
@@ -90,10 +203,7 @@ def safe_int(x: Any) -> Any:
     if isinstance(x, float):
         if math.isnan(x) or math.isinf(x):
             return x
-        if x.is_integer():
-            return int(x)
-        return x
-    # Try coercion from string-like
+        return int(x) if x.is_integer() else x
     try:
         f = float(x)
         return int(f) if f.is_integer() else f
@@ -102,7 +212,6 @@ def safe_int(x: Any) -> Any:
 
 
 def safe_sum(values) -> float:
-    """Sum safely; returns 0.0 for empty input."""
     total = 0.0
     for v in values:
         if v is None:
@@ -114,9 +223,9 @@ def safe_sum(values) -> float:
     return total
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 #  FIELD KNOWLEDGE
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 COLUMN_SYNONYMS = {
     "product": [
@@ -232,6 +341,7 @@ META_LABELS = {
         "net weight", "net weight (kgs)", "net weight (kg)", "net kg",
         "net weight kgs",
     ],
+    "gross_weight": ["gross weight", "gross kg", "gross weight (kg)"],
     "notes": ["notes", "note", "comments", "comment", "remarks"],
 }
 
@@ -241,8 +351,10 @@ DOC_TYPES = {
     "proforma": ["proforma", "pro forma", "pro-forma", "proforma invoice"],
     "receipt": ["receipt", "payment receipt"],
     "delivery_note": ["delivery note", "delivery", "dispatch note"],
+    "packing_list": ["packing list", "packing slip"],
     "credit_note": ["credit note", "credit memo"],
     "purchase_order": ["purchase order", "purchase order form"],
+    "statement": ["statement", "account statement"],
 }
 
 CURRENCY_WORDS = {
@@ -263,9 +375,9 @@ FIELD_PATTERNS = {
 }
 
 
-# ---------------------------------------------------------------------------
-#  NORMALIZATION / NUMBERS
-# ---------------------------------------------------------------------------
+# ===========================================================================
+#  NORMALIZATION
+# ===========================================================================
 
 def norm(s: Any) -> str:
     s = "" if s is None else str(s)
@@ -335,9 +447,9 @@ def empty_field(value: Any) -> bool:
     return s == "" or s in {"n/a", "na", "null", "none", "-", "—"}
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 #  LABEL MATCHING
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 def match_header(label: str) -> Optional[str]:
     l = norm(label)
@@ -389,9 +501,9 @@ def match_meta_label(label: str) -> Optional[str]:
     return best_meta if best_score >= 91 else None
 
 
-# ---------------------------------------------------------------------------
-#  DOCUMENT CLASSIFICATION / METADATA
-# ---------------------------------------------------------------------------
+# ===========================================================================
+#  DOCUMENT CLASSIFICATION
+# ===========================================================================
 
 def detect_document_type(text: str) -> Optional[str]:
     low = norm(text[:12000])
@@ -434,14 +546,20 @@ def extract_meta_from_text(text: str) -> Dict[str, Any]:
             if word in c:
                 meta["currency"] = code
                 break
+    else:
+        # Try to detect currency from text
+        for word, code in CURRENCY_WORDS.items():
+            if re.search(rf"\b{word}\b", norm(text)):
+                meta["currency"] = code
+                break
 
     meta["document_type"] = detect_document_type(text)
     return meta
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 #  PRODUCT SAFETY
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 NON_PRODUCT_TERMS = {
     "invoice", "invoice details", "invoice number", "quotation", "proforma",
@@ -480,7 +598,8 @@ def looks_like_product(name: str) -> bool:
     if ADDRESS_TERMS.search(n):
         return False
     if COMPANY_TERMS.search(n) and not re.search(
-        r"\b(rose|roses|flower|flowers|plant|goods|supplies)\b", n, re.I
+        r"\b(rose|roses|flower|flowers|plant|goods|supplies|carnation|"
+        r"chrysanthemum|tulip|lily|orchid|gerbera|alstroemeria)\b", n, re.I
     ):
         return False
 
@@ -509,9 +628,9 @@ def is_header_or_metadata(line: str) -> bool:
     return False
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 #  FREE-FORM LINE PARSING
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 def extract_labeled_fields(line: str) -> Dict[str, Any]:
     result: Dict[str, Any] = {}
@@ -574,6 +693,7 @@ def strip_known_annotations(name: str) -> str:
         s = re.sub(pat, " ", s, flags=re.I)
 
     s = re.sub(r"(?i)(?<=\d)\s*(?:usd|us\$|kes|ksh|eur|gbp|aed|sar|qar)\b", " ", s)
+    s = re.sub(r"[\$€£]", " ", s)
     s = re.sub(r"\s+", " ", s).strip(" -:,;.|")
     return s
 
@@ -622,9 +742,9 @@ def parse_inline_line(line: str) -> Optional[Dict[str, Any]]:
     return item
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 #  TABLE PARSING
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 def split_columns(line: str) -> List[str]:
     if "|" in line:
@@ -724,9 +844,9 @@ def parse_table_row(line: str, headers: List[Optional[str]]) -> Optional[Dict[st
     return item
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 #  TEXT ENGINE
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 def parse_order_text(text: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     text = clean_ocr_text(text)
@@ -762,9 +882,9 @@ def parse_order_text(text: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     return clean_items(items), meta
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 #  EXCEL / CSV
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 def find_excel_header(df: pd.DataFrame) -> Tuple[Optional[int], Dict[int, str]]:
     best = None
@@ -860,9 +980,9 @@ def extract_from_excel(content: bytes, ext: str) -> Tuple[List[Dict[str, Any]], 
         return [], {"error": str(e)}
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 #  DOCUMENT EXTRACTION
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 def extract_text_from_pdf(content: bytes) -> Tuple[str, str]:
     text_parts = []
@@ -887,11 +1007,11 @@ def extract_text_from_pdf(content: bytes) -> Tuple[str, str]:
         doc = fitz.open(stream=content, filetype="pdf")
         ocr_parts = []
         for page in doc:
-            pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), alpha=False)
+            pix = page.get_pixmap(matrix=fitz.Matrix(2.5, 2.5), alpha=False)
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
             ocr_parts.append(ocr_image(img))
         return "\n".join(ocr_parts), "pdf_ocr"
-    except Exception as e:
+    except Exception:
         logger.exception("PDF OCR failed")
         return text, "pdf_text"
 
@@ -909,7 +1029,7 @@ def extract_text_from_docx(content: bytes) -> str:
                 if any(cells):
                     parts.append(" | ".join(cells))
         return "\n".join(parts)
-    except Exception as e:
+    except Exception:
         logger.exception("DOCX failed")
         return ""
 
@@ -930,7 +1050,7 @@ def preprocess_image(img: Image.Image) -> Image.Image:
 
 def ocr_image(img: Image.Image) -> str:
     processed = preprocess_image(img)
-    configs = ["--oem 3 --psm 6", "--oem 3 --psm 11", "--oem 3 --psm 4"]
+    configs = ["--oem 3 --psm 6", "--oem 3 --psm 11", "--oem 3 --psm 4", "--oem 3 --psm 3"]
     results = []
     for cfg in configs:
         try:
@@ -949,7 +1069,7 @@ def extract_text_from_image(content: bytes) -> Tuple[str, str]:
     try:
         img = Image.open(io.BytesIO(content))
         return ocr_image(img), "image_ocr"
-    except Exception as e:
+    except Exception:
         logger.exception("Image extraction failed")
         return "", "image_error"
 
@@ -962,9 +1082,9 @@ def extract_text_from_json(content: bytes) -> Tuple[str, str]:
         return content.decode("utf-8", errors="ignore"), "text"
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 #  VALIDATION / CLEANING
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 def validate_item(item: Dict[str, Any]) -> List[str]:
     warnings = []
@@ -1005,7 +1125,6 @@ def validate_item(item: Dict[str, Any]) -> List[str]:
 
 
 def clean_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Missing values remain None. Nothing invented."""
     cleaned = []
 
     for raw in items:
@@ -1036,7 +1155,6 @@ def clean_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if raw.get("raw_values"):
             out["raw_values"] = raw["raw_values"]
 
-        # Safe derivation only when unambiguous
         if out["quantity"] is None and out["boxes"] is not None and out["pack_rate"] is not None:
             try:
                 out["quantity"] = as_number(float(out["boxes"]) * float(out["pack_rate"]))
@@ -1075,9 +1193,212 @@ def clean_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return cleaned
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
+#  AI ANALYSIS LAYER (NEW)
+# ===========================================================================
+
+FLOWER_FAMILIES = {
+    "rose": ["rose", "roses", "rosa"],
+    "carnation": ["carnation", "carnations", "dianthus"],
+    "chrysanthemum": ["chrysanthemum", "chrysanthemums", "mum", "spray mum"],
+    "tulip": ["tulip", "tulips"],
+    "lily": ["lily", "lilies", "lilium"],
+    "orchid": ["orchid", "orchids", "phalaenopsis"],
+    "gerbera": ["gerbera", "gerberas", "gerber"],
+    "alstroemeria": ["alstroemeria", "alstromeria"],
+    "gypsophila": ["gypsophila", "gyp", "baby's breath"],
+    "hypericum": ["hypericum", "hypericums"],
+    "solidago": ["solidago", "goldenrod"],
+    "limonium": ["limonium", "statice"],
+    "eucalyptus": ["eucalyptus"],
+    "ruscus": ["ruscus"],
+    "leather_leaf": ["leather leaf", "leatherleaf"],
+}
+
+
+def infer_flower_family(product_name: str) -> Optional[str]:
+    low = norm(product_name)
+    for family, terms in FLOWER_FAMILIES.items():
+        for t in terms:
+            if re.search(rf"\b{re.escape(t)}\b", low):
+                return family
+    return None
+
+
+def confidence_band(conf: float) -> str:
+    if conf >= 0.90:
+        return "high"
+    if conf >= 0.75:
+        return "medium"
+    if conf >= 0.55:
+        return "low"
+    return "review_required"
+
+
+def build_insights(items: List[Dict[str, Any]], meta: Dict[str, Any]) -> List[Dict[str, Any]]:
+    insights = []
+
+    if not items:
+        insights.append({
+            "type": "no_items_detected",
+            "severity": "high",
+            "message": "No line items could be extracted. The document may be blank, "
+                       "image quality is poor, or the layout is unsupported.",
+        })
+        return insights
+
+    # Price outliers
+    prices = [float(i["unit_price"]) for i in items if i.get("unit_price")]
+    if len(prices) >= 3:
+        median = statistics.median(prices)
+        for i, item in enumerate(items):
+            p = item.get("unit_price")
+            if p is None or median == 0:
+                continue
+            deviation = abs(float(p) - median) / median
+            if deviation >= 0.5:
+                insights.append({
+                    "type": "price_outlier",
+                    "severity": "medium",
+                    "item_index": i,
+                    "product_name": item.get("product_name"),
+                    "message": f"Unit price {p} deviates {deviation*100:.0f}% from median "
+                               f"({median:.2f}) — verify against source.",
+                })
+
+    # Missing price warning
+    missing_price = [i for i in items if i.get("unit_price") is None]
+    if missing_price:
+        insights.append({
+            "type": "missing_unit_prices",
+            "severity": "medium",
+            "count": len(missing_price),
+            "message": f"{len(missing_price)} item(s) lack a unit price — likely truncated "
+                       f"or non-priced document (packing list / delivery note).",
+        })
+
+    # Quantity outliers
+    quantities = [float(i["quantity"]) for i in items if i.get("quantity")]
+    if len(quantities) >= 3:
+        median_q = statistics.median(quantities)
+        for i, item in enumerate(items):
+            q = item.get("quantity")
+            if q is None or median_q == 0:
+                continue
+            dev = abs(float(q) - median_q) / median_q
+            if dev >= 1.5:
+                insights.append({
+                    "type": "quantity_outlier",
+                    "severity": "low",
+                    "item_index": i,
+                    "product_name": item.get("product_name"),
+                    "message": f"Quantity {q} is {dev*100:.0f}% away from median "
+                               f"({median_q:.0f}) — confirm pack rate.",
+                })
+
+    # Currency missing
+    if not meta.get("currency"):
+        insights.append({
+            "type": "currency_unspecified",
+            "severity": "low",
+            "message": "Currency code was not detected. Defaulting to USD for calculations.",
+        })
+
+    # Document type unknown
+    if not meta.get("document_type"):
+        insights.append({
+            "type": "document_type_unknown",
+            "severity": "low",
+            "message": "Could not classify the document type with high confidence.",
+        })
+
+    # Single-item document
+    if len(items) == 1:
+        insights.append({
+            "type": "single_item_document",
+            "severity": "info",
+            "message": "Only one line item detected. Verify the table wasn't cut off.",
+        })
+
+    return insights
+
+
+def build_anomalies(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    anomalies = []
+    for i, item in enumerate(items):
+        for w in item.get("warnings", []):
+            anomalies.append({
+                "item_index": i,
+                "product_name": item.get("product_name"),
+                "code": w,
+                "severity": "high" if "not_match" in w else "medium",
+            })
+    return anomalies
+
+
+def build_recommendations(items: List[Dict[str, Any]], insights: List[Dict[str, Any]]) -> List[str]:
+    recs = []
+    if any(i["type"] == "no_items_detected" for i in insights):
+        recs.append("Re-upload a higher-resolution scan or provide a digitally-generated PDF.")
+    if any(i["type"] == "price_outlier" for i in insights):
+        recs.append("Cross-check outlier prices against your rate card before booking.")
+    if any(i["type"] == "missing_unit_prices" for i in insights):
+        recs.append("Confirm the document type — packing lists and delivery notes "
+                    "typically carry no prices.")
+    if any(i["type"] == "currency_unspecified" for i in insights):
+        recs.append("Specify the settlement currency explicitly to avoid FX ambiguity.")
+    if not recs:
+        recs.append("Extraction looks consistent. Proceed to product matching and storage.")
+    return recs
+
+
+def overall_trust_score(items: List[Dict[str, Any]], insights: List[Dict[str, Any]]) -> float:
+    if not items:
+        return 0.0
+    base = sum(i.get("confidence", 0.5) for i in items) / len(items)
+    penalty = 0.0
+    for ins in insights:
+        sev = ins.get("severity")
+        if sev == "high":
+            penalty += 0.10
+        elif sev == "medium":
+            penalty += 0.04
+        elif sev == "low":
+            penalty += 0.02
+    return round(max(0.0, min(1.0, base - penalty)), 3)
+
+
+def ai_analyze(items: List[Dict[str, Any]], meta: Dict[str, Any]) -> Dict[str, Any]:
+    insights = build_insights(items, meta)
+    anomalies = build_anomalies(items)
+    recommendations = build_recommendations(items, insights)
+    trust = overall_trust_score(items, insights)
+
+    # Narrative reasoning
+    doc_type = meta.get("document_type") or "unclassified document"
+    currency = meta.get("currency") or "unspecified currency"
+    n = len(items)
+    reasoning = (
+        f"Parsed a {doc_type} containing {n} line item(s) in {currency}. "
+        f"Detected {len(anomalies)} arithmetic or structural anomaly(ies) and "
+        f"{len(insights)} analytical insight(s). "
+        f"Overall trust score is {trust:.2f} ({confidence_band(trust)})."
+    )
+
+    return {
+        "trust_score": trust,
+        "confidence_band": confidence_band(trust),
+        "reasoning": reasoning,
+        "insights": insights,
+        "anomalies": anomalies,
+        "recommendations": recommendations,
+        "analyzed_at": datetime.utcnow().isoformat() + "Z",
+    }
+
+
+# ===========================================================================
 #  PRODUCT MATCHING
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 def normalize_product_for_match(name: str) -> str:
     n = norm(name)
@@ -1145,9 +1466,9 @@ async def match_products_endpoint(req: MatchRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 #  ENDPOINTS
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 @app.get("/")
 async def root():
@@ -1157,10 +1478,13 @@ async def root():
         "status": "operational",
         "capabilities": [
             "invoice", "quotation", "proforma", "receipt", "delivery_note",
-            "purchase_order", "images_ocr", "scanned_pdf_ocr",
-            "pdf_text", "docx", "xlsx", "xls", "xlsm", "csv", "json", "text",
+            "packing_list", "purchase_order", "credit_note", "statement",
+            "images_ocr", "scanned_pdf_ocr", "pdf_text", "docx",
+            "xlsx", "xls", "xlsm", "csv", "json", "text",
             "confidence_scoring", "validation", "provenance",
             "safe_blank_fields", "product_matching",
+            "strict_price_routing", "ai_analysis", "anomaly_detection",
+            "trust_score", "recommendations",
         ],
         "endpoints": [
             "/api/health",
@@ -1237,36 +1561,50 @@ async def analyze(
 
         cleaned = clean_items(items)
 
-        if text_extracted and not metadata:
-            metadata = extract_meta_from_text(text_extracted)
+        if text_extracted and not metadata.get("document_type"):
+            extra_meta = extract_meta_from_text(text_extracted)
+            extra_meta.update({k: v for k, v in metadata.items() if v})
+            metadata = extra_meta
 
-        # ---- SAFE TOTALS (fixed bug) ----
-        total_boxes_f = safe_sum(x.get("boxes") for x in cleaned)
-        total_qty_f = safe_sum(x.get("quantity") for x in cleaned)
-        total_amount_f = safe_sum(x.get("total") for x in cleaned)
+        # Enforce strict routing via Pydantic
+        routed_items: List[Dict[str, Any]] = []
+        for raw in cleaned:
+            try:
+                validated = ExtractedLineItem(**raw)
+                dumped = validated.model_dump()
+                dumped["flower_family"] = infer_flower_family(dumped["product_name"])
+                dumped["confidence_band"] = confidence_band(dumped["confidence"])
+                routed_items.append(dumped)
+            except Exception as e:
+                logger.warning("Item failed strict routing: %s", e)
 
-        total_boxes = safe_int(total_boxes_f)
-        total_quantity = safe_int(total_qty_f)
-        total_amount = round(float(total_amount_f), 2)
+        # Safe totals
+        total_boxes = safe_int(safe_sum(x.get("boxes") for x in routed_items))
+        total_qty = safe_int(safe_sum(x.get("quantity") for x in routed_items))
+        total_amount = round(safe_sum(x.get("total") for x in routed_items), 2)
 
-        warnings = []
-        for x in cleaned:
-            warnings.extend(x.get("warnings", []))
+        warnings: List[str] = []
+        for x in routed_items:
+            warnings.extend(x.get("validation_warnings", []))
+
+        analysis = ai_analyze(routed_items, metadata)
 
         return {
             "success": True,
-            "items": cleaned,
+            "items": routed_items,
             "metadata": metadata,
             "document_type": metadata.get("document_type"),
             "total_boxes": total_boxes,
-            "total_quantity": total_quantity,
+            "total_quantity": total_qty,
             "total_amount": total_amount,
-            "item_count": len(cleaned),
+            "currency": metadata.get("currency", "USD"),
+            "item_count": len(routed_items),
             "review_required": any(
-                x.get("confidence", 0) < 0.80 or x.get("warnings")
-                for x in cleaned
+                x.get("confidence", 0) < 0.80 or x.get("validation_warnings")
+                for x in routed_items
             ),
             "warnings": sorted(set(warnings)),
+            "analysis": analysis,
             "text_extracted": text_extracted[:12000] if text_extracted else "",
             "extraction_method": extraction_method,
             "file_type": ext,
