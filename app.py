@@ -1,25 +1,29 @@
 """
-Smart Document Intelligence Engine v8.0
-Structured-table-first extraction with anchored column geometry.
+Smart Document Intelligence Engine v9.0
+Layout-aware, AI-grade extraction with structured table reconstruction.
 
-Fixes over v7:
-  • Table header anchoring prevents header words leaking into product rows
-  • Multi-line row stitching (item description wrapping across lines)
-  • Row-index stripping (leading "1 ", "2 ", ... never part of product name)
-  • Strict boilerplate/contact/link/address rejection
-  • Currency codes stripped inside numeric cells
-  • Free-form fallback is gated: only runs when no table was detected
+Pipeline:
+  1. Extract words with positions (PyMuPDF → PyPDF2 → OCR)
+  2. Reconstruct table grid via Y-clustering + X-gap detection
+  3. Semantic-tag every row (product / header / total / note / contact / …)
+  4. Resolve each product row's cells to canonical fields via header anchors
+  5. Cross-row arithmetic reconciliation (never invents; only repairs)
+  6. AI analysis envelope: trust score, insights, anomalies, recommendations
+
+Preserves the v7.0 API contract — no PHP or DB changes required.
 
 ALTECH SOFTWARE DEVELOPERS
 """
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
-import io, os, re, json, math, logging, statistics
 from datetime import datetime
+from collections import Counter
+import io, os, re, json, math, logging, statistics, concurrent.futures
 
 import pandas as pd
 import PyPDF2
@@ -29,7 +33,7 @@ import pytesseract
 from rapidfuzz import fuzz
 
 try:
-    import fitz
+    import fitz  # PyMuPDF
 except Exception:
     fitz = None
 
@@ -45,20 +49,21 @@ TESS_CMD = os.getenv("TESSERACT_CMD", "/usr/bin/tesseract")
 if os.path.exists(TESS_CMD):
     pytesseract.pytesseract.tesseract_cmd = TESS_CMD
 
-ENGINE_VERSION = "8.0.0"
+ENGINE_VERSION = "9.0.0"
 
 app = FastAPI(title="Smart Document Intelligence Engine",
               version=ENGINE_VERSION,
-              description="Structured-table-first, confidence-aware extraction engine.")
+              description="Layout-aware, AI-grade document extraction engine.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["*"], allow_headers=["*"])
 
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "25"))
 MIN_MATCH_CONFIDENCE = float(os.getenv("MIN_MATCH_CONFIDENCE", "0.60"))
+ANALYZE_TIMEOUT_SECONDS = int(os.getenv("ANALYZE_TIMEOUT_SECONDS", "120"))
 
 
 # ===========================================================================
-#  STRICT SCHEMA (unchanged contract, safer defaults)
+#  PYDANTIC SCHEMA (contract preserved)
 # ===========================================================================
 
 PRICE_PATTERN = re.compile(
@@ -98,7 +103,7 @@ class ExtractedLineItem(BaseModel):
         if CURRENCY_SYMBOLS.search(text) or PRICE_LABEL_WORDS.search(text):
             cleaned = PRICE_PATTERN.sub(" ", text)
             cleaned = re.sub(r"\s+", " ", cleaned).strip(" -:,;.|")
-            return cleaned if len(cleaned) >= 2 else "UNKNOWN_ITEM"
+            return cleaned if len(cleaned) >= 2 else None
         return text
 
     @field_validator("boxes", "pack_rate", "quantity", mode="before")
@@ -127,7 +132,7 @@ class ExtractedLineItem(BaseModel):
         w = list(self.validation_warnings)
         if self.quantity and self.unit_price and self.total:
             exp = self.quantity * self.unit_price
-            if abs(exp - self.total) > max(0.02, abs(self.total) * 0.02):
+            if abs(exp - self.total) > max(0.05, abs(self.total) * 0.02):
                 w.append("quantity_x_unit_price_does_not_match_total")
         if self.boxes and self.pack_rate and self.quantity:
             exp = self.boxes * self.pack_rate
@@ -143,21 +148,13 @@ class MatchRequest(BaseModel):
 
 
 # ===========================================================================
-#  NUMERIC / TEXT HELPERS
+#  TEXT HELPERS
 # ===========================================================================
 
 def norm(s: Any) -> str:
     s = "" if s is None else str(s)
-    s = s.replace("–", "-").replace("—", "-").replace("’", "'")
+    s = s.replace("–", "-").replace("—", "-").replace("’", "'").replace("“", '"').replace("”", '"')
     return re.sub(r"\s+", " ", s.strip().lower())
-
-
-def clean_ocr_text(text: str) -> str:
-    text = text.replace("\x00", "")
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\s+\|", " |", text)
-    text = re.sub(r"\|\s+", "| ", text)
-    return text
 
 
 def parse_number(value: Any) -> Optional[float]:
@@ -175,7 +172,6 @@ def parse_number(value: Any) -> Optional[float]:
     txt = re.sub(r"(?<=\d)\s+(?=\d)", "", txt).strip()
     if not txt:
         return None
-    # Handle 1,234.56 and 1.234,56
     if "," in txt and "." in txt:
         if txt.rfind(",") > txt.rfind("."):
             txt = txt.replace(".", "").replace(",", ".")
@@ -209,137 +205,7 @@ def empty_field(v) -> bool:
 
 
 # ===========================================================================
-#  BOILERPLATE / JUNK REJECTION  (BIG upgrade)
-# ===========================================================================
-
-BOILERPLATE_PATTERNS = [
-    r"^\s*thank\s+you\b",
-    r"^\s*thanks\b",
-    r"^\s*welcome\b",
-    r"^\s*please\s+note\b",
-    r"^\s*note\s*[:!]",
-    r"computer[- ]generated",
-    r"no\s+signature\s+required",
-    r"^\s*generated\s+on\b",
-    r"^\s*scan\s+to\s+verify\b",
-    r"^\s*page\s+\d+(\s+of\s+\d+)?\s*$",
-    r"^\s*invoice\s*(?:no|number|#)?\b[:\s]*[a-z0-9\-/]+",
-    r"^\s*(?:quotation|proforma|receipt|delivery\s+note)\b",
-    r"^\s*paid\s*$", r"^\s*sent\s*$", r"^\s*unpaid\s*$", r"^\s*draft\s*$",
-    r"^\s*(?:order|invoice)\s+details\s*$",
-    r"^\s*created\s+by\b",
-    r"^\s*bill\s+to\b", r"^\s*ship\s+to\b", r"^\s*consignee\b",
-    r"^\s*customer\s+details?\s*$",
-    r"^\s*terms?\s*(?:&|and)\s*conditions\b",
-    r"prices?\s+are\s+inclusive\s+of\s+vat",
-    r"delivery\s+cost\s+is\s+the\s+buyer",
-    r"total\s+price\s+per\s+item\s+is\s+inclusive",
-    r"other\s+charges\s*:?",
-    r"^\s*sub[- ]?total\b",
-    r"^\s*grand\s+total\b",
-    r"^\s*balance\s+due\b",
-    r"^\s*due\s+date\b",
-    r"^\s*payment\s+terms\b",
-]
-
-BOILERPLATE_RE = re.compile("|".join(BOILERPLATE_PATTERNS), re.IGNORECASE)
-
-PHONE_RE = re.compile(
-    r"(?:\+?\d[\d\s\-().]{6,}\d)", re.IGNORECASE)
-EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
-URL_RE = re.compile(r"(?:https?://|www\.)\S+|\b[a-z0-9\-]+\.(?:com|net|org|io|ke|co\.ke|tc|info|biz)\b", re.I)
-HASH_ID_RE = re.compile(r"^#?[A-Z]{2,}\d{4,}[A-Z0-9\-]*$", re.I)
-ADDRESS_RE = re.compile(
-    r"\b(street|st\.|road|rd\.|avenue|ave\.|boulevard|blvd\.|building|bldg|"
-    r"floor|suite|tower|plaza|po\s*box|p\.o\.|postal\s*code|zip|"
-    r"nairobi|dubai|amsterdam|bogota|quito|miami|johannesburg|"
-    r"kenya|uae|united\s+arab\s+emirates|netherlands|colombia|ecuador)\b",
-    re.IGNORECASE)
-NAME_HEADER_RE = re.compile(
-    r"^\s*(?:#\s*)?(?:product|service|description|variety|item|qty|"
-    r"quantity|unit\s*price|price|total|amount|boxes?|cartons?|"
-    r"pack\s*rate|rate)\b.*$", re.IGNORECASE)
-
-KNOWN_COMPANY_TERMS = re.compile(
-    r"\b(limited|ltd\.?|llc|inc\.?|plc|gmbh|bv|nv|s\.?a\.?|s\.?l\.?|"
-    r"company|enterprises?|investment|trading|holdings?|imports?|"
-    r"exports?|flowers?|roses?|logistics|freight|agency)\b", re.IGNORECASE)
-
-
-def is_boilerplate(line: str) -> bool:
-    if not line:
-        return True
-    s = line.strip()
-    if BOILERPLATE_RE.search(s):
-        return True
-    if URL_RE.search(s):
-        return True
-    if EMAIL_RE.search(s):
-        return True
-    if HASH_ID_RE.match(s):
-        return True
-    # a line dominated by digits/symbols
-    letters = re.findall(r"[A-Za-z]", s)
-    if len(letters) < 3 and len(s) < 30:
-        return True
-    return False
-
-
-def is_contact_or_address(line: str) -> bool:
-    s = line.strip()
-    if not s:
-        return True
-    if PHONE_RE.search(s) and len(re.findall(r"\d", s)) >= 7:
-        return True
-    if EMAIL_RE.search(s) or URL_RE.search(s):
-        return True
-    if ADDRESS_RE.search(s) and len(s.split()) <= 8:
-        return True
-    return False
-
-
-def is_table_header_line(line: str) -> bool:
-    """Detects rows like: '# PRODUCT / SERVICE DESCRIPTION QTY UNIT PRICE TOTAL'"""
-    s = re.sub(r"[|]", " ", line).strip()
-    if not s:
-        return False
-    toks = re.split(r"\s{2,}| \| ", s)
-    if len(toks) < 2:
-        toks = s.split()
-    joined = norm(s)
-    hits = 0
-    for key in ("product", "service", "description", "qty", "quantity",
-                "unit price", "price", "total", "amount", "boxes",
-                "pack rate", "rate"):
-        if key in joined:
-            hits += 1
-    return hits >= 2
-
-
-def strip_leading_row_index(name: str) -> Tuple[str, Optional[int]]:
-    """'12 Welding goggles/Shields' -> ('Welding goggles/Shields', 12)"""
-    m = re.match(r"^\s*(\d{1,3})\s*[.)]?\s+(.*\S)\s*$", name)
-    if m and len(m.group(2)) >= 2:
-        return m.group(2), int(m.group(1))
-    return name, None
-
-
-def looks_like_product(name: str) -> bool:
-    n = str(name or "").strip()
-    if len(n) < 2 or not re.search(r"[A-Za-z]{3,}", n):
-        return False
-    if is_boilerplate(n) or is_contact_or_address(n):
-        return False
-    if NAME_HEADER_RE.match(n) and len(n.split()) <= 6:
-        return False
-    # all-caps street-like
-    if ADDRESS_RE.search(n):
-        return False
-    return True
-
-
-# ===========================================================================
-#  HEADER KNOWLEDGE (unchanged core, plus '#' index)
+#  FIELD KNOWLEDGE
 # ===========================================================================
 
 COLUMN_SYNONYMS = {
@@ -348,10 +214,11 @@ COLUMN_SYNONYMS = {
                 "articles", "commodity", "goods", "stock item", "particulars",
                 "product description", "item description", "description of goods"],
     "variety": ["variety", "flower", "flower name", "flower type", "species",
-                "cultivar", "kind", "variety name"],
+                "cultivar", "kind", "variety name", "flower variety"],
     "description": ["description", "desc", "details", "item details",
                     "specification", "specifications", "remarks",
-                    "product details", "product / service description"],
+                    "product details", "product / service description",
+                    "service description"],
     "farm_code": ["farm code", "farmcode", "farm reference", "farm ref",
                   "supplier code", "grower code", "grower reference"],
     "boxes": ["boxes", "box", "bx", "cartons", "carton", "ctn", "cases",
@@ -365,7 +232,7 @@ COLUMN_SYNONYMS = {
     "quantity": ["quantity", "qty", "qnty", "stems", "pcs", "pieces", "count",
                  "total quantity", "total qty", "number of stems",
                  "stem quantity", "invoice quantity", "qty invoice",
-                 "quantity invoice"],
+                 "quantity invoice", "total stems"],
     "unit_price": ["price", "price per stem", "price/stem", "unit price",
                    "unit price (usd)", "unit price(usd)", "cost",
                    "price per unit", "per stem", "per piece",
@@ -373,7 +240,7 @@ COLUMN_SYNONYMS = {
                    "rate per stem", "selling price", "unit selling price"],
     "total": ["total", "total price", "total amount", "line total",
               "line amount", "sub-total", "subtotal", "extended price",
-              "total (usd)", "total(usd)", "line value"],
+              "total (usd)", "total(usd)", "line value", "amount"],
     "length": ["length", "length(cm)", "length (cm)", "size", "size(cm)",
                "stem length", "height", "stem size", "length cm"],
     "discount": ["discount", "disc.", "rebate"],
@@ -381,12 +248,11 @@ COLUMN_SYNONYMS = {
 }
 
 META_LABELS = {
-    "invoice_number": ["invoice number", "invoice no", "invoice #",
-                       "invoice no.", "inv no", "inv #", "quotation number",
-                       "quotation no", "quote number", "proforma number",
-                       "proforma no", "document number", "doc no",
-                       "reference", "ref no", "reference number",
-                       "document ref"],
+    "invoice_number": ["invoice number", "invoice no", "invoice #", "invoice no.",
+                       "inv no", "inv #", "quotation number", "quotation no",
+                       "quote number", "proforma number", "proforma no",
+                       "document number", "doc no", "reference", "ref no",
+                       "reference number", "document ref"],
     "date": ["date", "date of shipment", "shipment date", "invoice date",
              "issue date", "document date", "quotation date"],
     "due_date": ["due date", "payment due", "valid until", "valid till",
@@ -394,28 +260,23 @@ META_LABELS = {
     "currency": ["currency", "currency code", "ccy"],
     "vat_rate": ["vat rate", "vat rate (%)", "tax rate", "tax %", "vat %"],
     "country_destination": ["country of destination", "destination country",
-                            "destination", "country dest", "ship to country",
-                            "country destination"],
+                            "destination", "country dest", "ship to country"],
     "point_of_entry": ["point of entry", "port of entry", "entry point",
                        "port", "airport", "arrival port"],
     "country_origin": ["country of origin", "origin country"],
     "consignee_name": ["consignee name", "consignee", "bill to", "ship to",
-                       "customer name", "client name", "buyer name",
-                       "consignee details"],
+                       "customer name", "client name", "buyer name"],
     "consignee_address": ["consignee address", "bill to address",
                           "ship to address", "customer address",
                           "buyer address", "delivery address"],
-    "seller_name": ["seller name", "seller", "vendor", "supplier",
-                    "exporter", "seller / exporter", "exporter name"],
+    "seller_name": ["seller name", "seller", "vendor", "supplier", "exporter"],
     "purchase_order_no": ["purchase order no", "purchase order #",
                           "purchase order number", "purchase order",
                           "po no", "po #", "po number", "customer po",
-                          "order number", "purchase order no."],
-    "payment_terms": ["payment terms", "payment term", "terms of payment",
-                      "payment"],
+                          "order number"],
+    "payment_terms": ["payment terms", "payment term", "terms of payment"],
     "transportation": ["transportation", "transport", "shipment method",
-                       "mode of transport", "shipping method",
-                       "transportation details"],
+                       "mode of transport", "shipping method"],
     "awb_number": ["awb number", "awb no", "awb", "air waybill",
                    "tracking number", "waybill", "airway bill"],
     "net_weight": ["net weight", "net weight (kgs)", "net weight (kg)",
@@ -443,13 +304,13 @@ def match_header(label: str) -> Optional[str]:
     l = re.sub(r"[*:.#]+$", "", l).strip()
     if not l:
         return None
-    if l in {"#", "no", "no.", "s/n", "sn"}:
+    if l in {"#", "no", "no.", "s/n", "sn", "sr"}:
         return "row_index"
     for field, names in COLUMN_SYNONYMS.items():
         if l in {norm(x) for x in names}:
             return field
-    priority = ["pack_rate", "unit_price", "farm_code", "quantity",
-                "boxes", "length", "total", "product", "variety", "description"]
+    priority = ["pack_rate", "unit_price", "farm_code", "quantity", "boxes",
+                "length", "total", "product", "variety", "description"]
     for field in priority:
         for n in COLUMN_SYNONYMS[field]:
             nn = norm(n)
@@ -484,210 +345,378 @@ def match_meta_label(label: str) -> Optional[str]:
 
 
 # ===========================================================================
-#  DOCUMENT TYPE / META
+#  ROW / LINE CLASSIFIERS (semantic tagging)
 # ===========================================================================
 
-def detect_document_type(text: str) -> Optional[str]:
-    low = norm(text[:12000])
-    scores = {t: max([fuzz.partial_ratio(low, norm(w)) for w in ws] or [0])
-              for t, ws in DOC_TYPES.items()}
-    typ, score = max(scores.items(), key=lambda x: x[1])
-    return typ if score >= 70 else None
+PHONE_RE = re.compile(r"(?:\+?\d[\d\s\-().]{7,}\d)")
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+URL_RE = re.compile(r"(?:https?://|www\.)\S+|\b[a-z0-9\-]+\.(?:com|net|org|io|ke|co\.ke|tc|info|biz)\b", re.I)
+HASH_ID_RE = re.compile(r"^#?[A-Z]{2,}\d{4,}[A-Z0-9\-]*$", re.I)
+ADDRESS_RE = re.compile(
+    r"\b(street|st\.|road|rd\.|avenue|ave\.|boulevard|blvd\.|building|bldg|"
+    r"floor|suite|tower|plaza|po\s*box|p\.o\.|postal\s*code|zip|"
+    r"nairobi|dubai|amsterdam|bogota|quito|miami|johannesburg|"
+    r"kenya|uae|united\s+arab\s+emirates|netherlands|colombia|ecuador)\b",
+    re.IGNORECASE)
+
+BOILERPLATE_RE = re.compile("|".join([
+    r"^\s*thank\s+you\b", r"^\s*thanks\b", r"^\s*welcome\b",
+    r"computer[- ]generated", r"no\s+signature\s+required",
+    r"^\s*generated\s+on\b", r"^\s*scan\s+to\s+verify\b",
+    r"^\s*page\s+\d+(\s+of\s+\d+)?\s*$",
+    r"^\s*paid\s*$", r"^\s*sent\s*$", r"^\s*unpaid\s*$", r"^\s*draft\s*$",
+    r"^\s*(?:order|invoice)\s+details\s*$",
+    r"^\s*(?:bill\s+to|ship\s+to|sold\s+to|consignee|consignor)\b",
+    r"^\s*sub[- ]?total\b", r"^\s*grand\s+total\b",
+    r"^\s*balance\s+due\b", r"^\s*due\s+date\b",
+    r"^\s*payment\s+terms\b",
+    r"prices?\s+are\s+inclusive\s+of\s+vat",
+    r"delivery\s+cost\s+is\s+the\s+buyer",
+    r"total\s+price\s+per\s+item\s+is\s+inclusive",
+    r"verify\s+at\s*:",
+    r"^\s*other\s+charges\b", r"^\s*awb\s+fee\b",
+]), re.IGNORECASE)
 
 
-def extract_meta_from_text(text: str) -> Dict[str, Any]:
-    meta: Dict[str, Any] = {}
-    lines = [x.strip() for x in clean_ocr_text(text).splitlines() if x.strip()]
-    for i, line in enumerate(lines):
-        m = re.match(r"^\s*([A-Za-z][A-Za-z0-9\s./()%#*&_-]{1,70}?)\s*"
-                     r"(?:[:#]\s*|-\s+|\|\s*)(.*?)\s*$", line)
-        if m:
-            label, value = m.group(1), m.group(2).strip()
-            field = match_meta_label(label)
-            if field and value and not empty_field(value):
-                meta[field] = value
-                continue
-        field = match_meta_label(line.rstrip(":#"))
-        if field and i + 1 < len(lines):
-            nxt = lines[i + 1]
-            if nxt and not match_meta_label(nxt) and not re.match(r"^[A-Za-z].*[:#]", nxt):
-                if field not in meta:
-                    meta[field] = nxt
-    if "currency" in meta:
-        c = norm(meta["currency"])
-        for word, code in {"usd": "USD", "kes": "KES", "ksh": "KES",
-                           "eur": "EUR", "euro": "EUR", "gbp": "GBP",
-                           "pound": "GBP", "aed": "AED", "sar": "SAR",
-                           "qar": "QAR", "dollar": "USD"}.items():
-            if word in c:
-                meta["currency"] = code
-                break
-    else:
-        for word, code in {"kes": "KES", "ksh": "KES", "usd": "USD",
-                           "eur": "EUR", "gbp": "GBP", "aed": "AED"}.items():
-            if re.search(rf"\b{word}\b", norm(text)):
-                meta["currency"] = code
-                break
-    meta["document_type"] = detect_document_type(text)
-    return meta
+def is_boilerplate(line: str) -> bool:
+    if not line:
+        return True
+    s = line.strip()
+    if BOILERPLATE_RE.search(s):
+        return True
+    if URL_RE.search(s) or EMAIL_RE.search(s):
+        return True
+    if HASH_ID_RE.match(s):
+        return True
+    letters = re.findall(r"[A-Za-z]", s)
+    if len(letters) < 3 and len(s) < 30:
+        return True
+    return False
+
+
+def is_contact_or_address(line: str) -> bool:
+    s = (line or "").strip()
+    if not s:
+        return True
+    if PHONE_RE.search(s) and len(re.findall(r"\d", s)) >= 7:
+        return True
+    if EMAIL_RE.search(s) or URL_RE.search(s):
+        return True
+    if ADDRESS_RE.search(s) and len(s.split()) <= 8:
+        return True
+    return False
+
+
+def has_alpha(s: str, minimum: int = 3) -> bool:
+    return len(re.findall(r"[A-Za-z]", s or "")) >= minimum
+
+
+def looks_like_product(name: str) -> bool:
+    n = (name or "").strip()
+    if len(n) < 2 or not has_alpha(n, 3):
+        return False
+    if is_boilerplate(n) or is_contact_or_address(n):
+        return False
+    # Header words alone
+    if match_header(n) and len(n.split()) <= 4:
+        return False
+    # Pure numbers / symbols
+    if re.fullmatch(r"[\d\s.,:/()%$€£+\-]+", n):
+        return False
+    return True
 
 
 # ===========================================================================
-#  TABLE DETECTION (anchor row, not just header)
+#  LAYOUT ENGINE — words with positions → table grid
 # ===========================================================================
 
-def find_table_anchor(lines: List[str]) -> Optional[int]:
-    """Find index of the most header-like line."""
-    best_idx, best_score = None, 0
-    for i, line in enumerate(lines):
-        if not is_table_header_line(line):
-            continue
-        mapped = [match_header(c) for c in split_columns(line)]
-        known = [m for m in mapped if m and m != "row_index"]
-        if len(known) < 2:
-            continue
-        score = len(known)
-        # Must include a product-ish or numeric field to count
-        if any(k in known for k in ("product", "description", "variety", "quantity",
-                                     "unit_price", "total", "boxes", "pack_rate")):
-            if score > best_score:
-                best_score, best_idx = score, i
-    return best_idx
+class Word:
+    __slots__ = ("text", "x0", "y0", "x1", "y1", "page", "line_id")
+
+    def __init__(self, text, x0, y0, x1, y1, page=0):
+        self.text = text
+        self.x0, self.y0, self.x1, self.y1 = x0, y0, x1, y1
+        self.page = page
+        self.line_id = None
+
+    @property
+    def cx(self):
+        return (self.x0 + self.x1) / 2.0
+
+    @property
+    def cy(self):
+        return (self.y0 + self.y1) / 2.0
 
 
-def split_columns(line: str) -> List[str]:
-    if "|" in line:
-        parts = [x.strip() for x in re.split(r"\s*\|\s*", line)]
-    elif "\t" in line:
-        parts = [x.strip() for x in line.split("\t")]
-    else:
-        parts = [x.strip() for x in re.split(r"\s{2,}", line.strip())]
-    return [x for x in parts if x != ""]
+def cluster_rows(words: List[Word], y_tol: float = 4.0) -> List[List[Word]]:
+    """Group words into visual rows by Y proximity."""
+    if not words:
+        return []
+    words = sorted(words, key=lambda w: (w.page, w.cy, w.x0))
+    rows: List[List[Word]] = []
+    cur = [words[0]]
+    cur_y = words[0].cy
+    for w in words[1:]:
+        if w.page != cur[0].page or abs(w.cy - cur_y) > y_tol:
+            rows.append(sorted(cur, key=lambda x: x.x0))
+            cur = [w]
+            cur_y = w.cy
+        else:
+            cur.append(w)
+            cur_y = (cur_y * (len(cur) - 1) + w.cy) / len(cur)
+    if cur:
+        rows.append(sorted(cur, key=lambda x: x.x0))
+    return rows
 
 
-def header_columns_for(anchor_line: str) -> List[str]:
+def row_text(row: List[Word]) -> str:
+    return " ".join(w.text for w in row)
+
+
+def detect_column_gaps(rows: List[List[Word]],
+                       min_gap: float = 12.0,
+                       min_cols: int = 2) -> List[Tuple[float, float]]:
     """
-    Given '# PRODUCT / SERVICE DESCRIPTION QTY UNIT PRICE TOTAL'
-    produce a canonical column list in order.
+    Find column boundaries by looking at X-gaps that are consistent across rows.
+    Returns list of (start_x, end_x) column ranges.
     """
-    s = anchor_line.strip()
-    s = re.sub(r"^[#\s]+", "", s)
-    # strip trailing boilerplate if present
-    # split on 2+ spaces or pipe or tabs (columns tend to be wide-spaced)
-    cols = re.split(r"\s{2,}|\s*\|\s*|\t+", s)
-    if len(cols) < 2:
-        cols = re.split(r"\s+", s)
-    # merge known two-word labels
-    merged: List[str] = []
+    # Build histogram of horizontal gaps between adjacent words in each row
+    gap_hits: List[Tuple[float, float]] = []  # (gap_start, gap_end)
+    for row in rows:
+        for i in range(len(row) - 1):
+            g = row[i + 1].x0 - row[i].x1
+            if g >= min_gap:
+                gap_hits.append((row[i].x1, row[i + 1].x0))
+
+    if not gap_hits:
+        return []
+
+    # Cluster overlapping gaps
+    gap_hits.sort()
+    clusters: List[Tuple[float, float]] = []
+    for gs, ge in gap_hits:
+        if clusters and gs <= clusters[-1][1] + 2:
+            clusters[-1] = (clusters[-1][0], max(clusters[-1][1], ge))
+        else:
+            clusters.append((gs, ge))
+
+    # Column boundaries are midpoints of gap clusters
+    boundaries = [(a + b) / 2.0 for a, b in clusters]
+
+    # Build column ranges
+    page_min = min(w.x0 for row in rows for w in row)
+    page_max = max(w.x1 for row in rows for w in row)
+    edges = [page_min] + boundaries + [page_max + 1]
+    cols = [(edges[i], edges[i + 1]) for i in range(len(edges) - 1)]
+    if len(cols) < min_cols:
+        return []
+    return cols
+
+
+def assign_words_to_columns(row: List[Word],
+                            cols: List[Tuple[float, float]]) -> List[str]:
+    """Assign each word to the column whose x-range overlaps its center."""
+    buckets: List[List[Word]] = [[] for _ in cols]
+    for w in row:
+        placed = False
+        for i, (a, b) in enumerate(cols):
+            if a <= w.cx < b:
+                buckets[i].append(w)
+                placed = True
+                break
+        if not placed:
+            # fall back to nearest column
+            best_i, best_d = 0, 1e9
+            for i, (a, b) in enumerate(cols):
+                mid = (a + b) / 2.0
+                d = abs(w.cx - mid)
+                if d < best_d:
+                    best_d, best_i = d, i
+            buckets[best_i].append(w)
+    return [" ".join(w.text for w in sorted(b, key=lambda x: x.x0)).strip()
+            for b in buckets]
+
+
+# ===========================================================================
+#  HEADER DETECTION — multi-line, from word grid
+# ===========================================================================
+
+HEADER_TOKENS = {
+    "flower", "variety", "length", "pack", "rate", "boxes", "box",
+    "total", "stems", "stem", "unit", "price", "amount", "qty", "quantity",
+    "description", "product", "service", "item", "no", "#", "s/n",
+    "cartons", "carton", "bundles", "bundle", "val", "value",
+}
+
+
+def header_score(row_text_: str) -> int:
+    s = norm(row_text_)
+    if "$" in s or len(re.findall(r"\d", s)) >= 3:
+        return 0
+    toks = re.findall(r"[a-z#/]+", s)
+    if not toks:
+        return 0
+    hits = sum(1 for t in toks if t in HEADER_TOKENS)
+    return hits if hits >= 1 and hits >= len(toks) - 1 else 0
+
+
+def stitch_header_rows(rows: List[List[Word]]) -> Tuple[Optional[int], Optional[int], List[Optional[str]]]:
+    """
+    Find the best header block (1+ consecutive header-ish rows) and return
+    (start_idx, end_idx_exclusive, mapped_columns).
+    """
+    best = None
     i = 0
-    while i < len(cols):
-        cur = cols[i].strip()
-        if not cur:
+    while i < len(rows):
+        rt = row_text(rows[i])
+        if header_score(rt) == 0:
             i += 1
             continue
-        nxt = cols[i + 1].strip() if i + 1 < len(cols) else ""
-        combined = norm(cur + " " + nxt) if nxt else ""
-        if combined in {"unit price", "pack rate", "line total",
-                         "product service", "service description",
-                         "product description"}:
+        start = i
+        end = i + 1
+        while end < len(rows) and header_score(row_text(rows[end])) > 0:
+            end += 1
+        # Stitch
+        parts = [row_text(rows[k]) for k in range(start, end)]
+        stitched = " ".join(parts)
+        cols = header_columns_for(stitched)
+        mapped = [match_header(c) for c in cols]
+        known = [m for m in mapped if m and m != "row_index"]
+        has_product = any(k in known for k in ("product", "description", "variety"))
+        has_numeric = any(k in known for k in ("quantity", "total",
+                                               "unit_price", "boxes", "pack_rate"))
+        if has_product and has_numeric and len(set(known)) >= 3:
+            score = len(set(known)) + (3 if has_product else 0) + (2 if has_numeric else 0)
+            if best is None or score > best[0]:
+                best = (score, start, end, mapped)
+        i = end
+    if not best:
+        return None, None, []
+    _, start, end, mapped = best
+    return start, end, mapped
+
+
+def header_columns_for(stitched: str) -> List[str]:
+    s = stitched.strip()
+    s = re.sub(r"^[#\s]+", "", s)
+    # Prefer wide gaps
+    cols = re.split(r"\s{3,}|\s*\|\s*|\t+", s)
+    cols = [c.strip() for c in cols if c.strip()]
+    if len(cols) < 2:
+        cols = s.split()
+    # Merge known two-word labels
+    merged, i = [], 0
+    while i < len(cols):
+        cur = cols[i]
+        nxt = cols[i + 1] if i + 1 < len(cols) else ""
+        combo = norm(cur + " " + nxt) if nxt else ""
+        if combo in {"unit price", "pack rate", "line total",
+                     "total stems", "total amount", "product service",
+                     "service description", "flower variety"}:
             merged.append(cur + " " + nxt)
             i += 2
             continue
         merged.append(cur)
         i += 1
-    return merged
-
-
-def header_map_for(anchor_line: str) -> List[Optional[str]]:
-    cols = header_columns_for(anchor_line)
-    mapped = []
-    for c in cols:
-        m = match_header(c)
-        mapped.append(m)
-    # If any column ends up None but a token like 'UNIT' or 'PRICE' is adjacent, try joined again.
-    # Deduplicate; keep positional.
-    return mapped
+    # Drop lone index tokens
+    return [c for c in merged if norm(c) not in {"#", "no", "no.", "s/n", "sr"}]
 
 
 # ===========================================================================
-#  TOKEN / CELL EXTRACTION FOR TABLE ROWS
+#  TABLE RECONSTRUCTION FROM WORD GRID
 # ===========================================================================
 
-NUMBER_RE = re.compile(r"^\s*(?:[$€£]|KES|KSH|USD|EUR|GBP|AED|SAR|QAR)?\s*"
-                       r"\d{1,3}(?:[,\s]\d{3})*(?:\.\d+)?\s*"
-                       r"(?:[$€£]|KES|KSH|USD|EUR|GBP|AED|SAR|QAR)?\s*$",
-                       re.IGNORECASE)
+NUMERIC_FIELDS = {"boxes", "pack_rate", "quantity", "unit_price", "total"}
 
 
 def is_numeric_cell(cell: str) -> bool:
     if not cell:
         return False
-    return bool(NUMBER_RE.match(cell.strip()))
+    s = cell.strip()
+    s = re.sub(r"[\$€£]", "", s)
+    s = re.sub(r"(?i)\b(?:usd|kes|ksh|eur|gbp|aed|sar|qar)\b", "", s).strip()
+    if not s:
+        return False
+    return bool(re.fullmatch(r"\d{1,3}(?:[,\s]\d{3})*(?:\.\d+)?", s))
 
 
-def split_row_into_cells(row: str) -> List[str]:
+def strip_row_index(text: str) -> Tuple[str, Optional[int]]:
+    m = re.match(r"^\s*(\d{1,3})\s*[.)]?\s+(.*\S)\s*$", text or "")
+    if m and len(m.group(2)) >= 2:
+        return m.group(2).strip(), int(m.group(1))
+    return text, None
+
+
+def resolve_row_cells(cells: List[str],
+                      headers: List[Optional[str]]) -> Dict[str, Any]:
     """
-    Try to tokenize a data row into cells based on wide gaps or pipes.
-    """
-    if "|" in row:
-        parts = [x.strip() for x in re.split(r"\s*\|\s*", row)]
-        return [p for p in parts if p != ""]
-    if "\t" in row:
-        parts = [x.strip() for x in row.split("\t")]
-        return [p for p in parts if p != ""]
-    parts = [x.strip() for x in re.split(r"\s{2,}", row.strip())]
-    if len(parts) >= 3:
-        return [p for p in parts if p != ""]
-    return [row.strip()]
-
-
-def assign_cells_to_columns(cells: List[str], headers: List[Optional[str]],
-                            numeric_fields: set) -> Dict[str, Any]:
-    """
-    Positional assignment with right-alignment preference for numeric fields.
+    Assign cells to fields using header column order.
+    Handles when the row has fewer cells than headers (uses numeric heuristics).
     """
     result: Dict[str, Any] = {}
     raw: Dict[str, str] = {}
 
-    # Identify which header slots are numeric in this table
-    numeric_slots = [i for i, h in enumerate(headers)
-                     if h in numeric_fields]
-    product_slots = [i for i, h in enumerate(headers)
-                     if h in ("product", "description", "variety")]
+    # Trim trailing empties
+    cells = list(cells)
+    while cells and not cells[-1]:
+        cells.pop()
+    if not cells:
+        return result
 
-    # Split incoming cells into text-ish and numeric-ish buckets
-    nums, texts = [], []
+    numeric_slots = [i for i, h in enumerate(headers) if h in NUMERIC_FIELDS]
+    product_slots = [i for i, h in enumerate(headers) if h in ("product", "description", "variety")]
+    length_slots = [i for i, h in enumerate(headers) if h == "length"]
+
+    # Classify
+    num_cells, txt_cells = [], []
     for c in cells:
-        if is_numeric_cell(c):
-            nums.append(c)
-        else:
-            texts.append(c)
+        (num_cells if is_numeric_cell(c) else txt_cells).append(c)
 
-    # Assign numerics to numeric slots from the right (usually qty, price, total ...)
-    assigned = {}
-    for slot, val in zip(reversed(numeric_slots), reversed(nums)):
+    assigned: Dict[int, str] = {}
+
+    # Lead text → first product slot
+    if txt_cells and product_slots:
+        head, ridx = strip_row_index(txt_cells[0])
+        if head:
+            assigned[product_slots[0]] = head
+        if ridx is not None:
+            result["row_index"] = ridx
+        leftover_text = txt_cells[1:]
+    else:
+        leftover_text = list(txt_cells)
+
+    # Remaining text → other product slots in order
+    for slot in product_slots[1:]:
+        if slot in assigned or not leftover_text:
+            continue
+        assigned[slot] = leftover_text.pop(0)
+
+    # Length: a numeric in the 20..250 range that fits the length column
+    remaining_nums = list(num_cells)
+    for slot in length_slots:
+        for k, v in enumerate(remaining_nums):
+            n = parse_number(v)
+            if n is not None and 20 <= n <= 250:
+                assigned[slot] = v
+                remaining_nums.pop(k)
+                break
+
+    # Remaining numerics fill remaining numeric slots left-to-right
+    open_slots = [s for s in numeric_slots if s not in assigned]
+    for slot, val in zip(open_slots, remaining_nums):
         assigned[slot] = val
 
-    # Assign remaining text to product-ish slots first
-    remaining_texts = [c for c in texts]
-    for slot in product_slots:
-        if slot in assigned:
-            continue
-        if remaining_texts:
-            assigned[slot] = remaining_texts.pop(0)
+    consumed = set(assigned.values())
+    for v in num_cells:
+        if v not in consumed:
+            raw[f"unmapped_numeric_{len(raw)+1}"] = v
 
-    # Anything left: fill empty header slots in order
-    for i, h in enumerate(headers):
-        if h is None or i in assigned:
-            continue
-        if remaining_texts:
-            assigned[i] = remaining_texts.pop(0)
-
+    # Commit
     for i, val in assigned.items():
         field = headers[i]
         if not field or field == "row_index":
             continue
-        if field in numeric_fields:
+        if field in NUMERIC_FIELDS:
             n = parse_number(val)
             if n is not None:
                 result[field] = as_number(n)
@@ -705,39 +734,45 @@ def assign_cells_to_columns(cells: List[str], headers: List[Optional[str]],
     return result
 
 
-# ===========================================================================
-#  TABLE EXTRACTION — the main improvement
-# ===========================================================================
-
-NUMERIC_FIELDS = {"boxes", "pack_rate", "quantity", "unit_price", "total"}
-
-
-def extract_table_items(lines: List[str], anchor_idx: int) -> List[Dict[str, Any]]:
-    anchor_line = lines[anchor_idx]
-    headers = header_map_for(anchor_line)
-    if not any(headers):
+def reconstruct_table_from_grid(rows: List[List[Word]]) -> List[Dict[str, Any]]:
+    """
+    Full pipeline: header detection → column gap detection → row-by-row assignment.
+    """
+    if not rows:
         return []
 
-    items: List[Dict[str, Any]] = []
-    pending_cells: List[str] = []
+    h_start, h_end, headers = stitch_header_rows(rows)
+    if h_start is None:
+        return []
 
-    def flush(pending):
-        if not pending:
+    # Determine column boundaries using data rows only
+    data_rows = rows[h_end:]
+    cols = detect_column_gaps(data_rows, min_gap=10.0, min_cols=2)
+    if not cols:
+        # Fall back to single-wide-column layout
+        cols = [(min(w.x0 for row in rows for w in row),
+                 max(w.x1 for row in rows for w in row) + 1)]
+
+    items: List[Dict[str, Any]] = []
+    pending_cells: Optional[List[str]] = None
+
+    def flush(cells):
+        if not cells or not any(c.strip() for c in cells):
             return
-        row_dict = assign_cells_to_columns(pending, headers, NUMERIC_FIELDS)
+        row_dict = resolve_row_cells(cells, headers)
         name = None
         for key in ("product", "description", "variety"):
             if row_dict.get(key) and looks_like_product(str(row_dict[key])):
                 name = str(row_dict[key]).strip()
                 break
         if not name:
-            for c in pending:
+            for c in cells:
                 if looks_like_product(c):
                     name = c.strip()
                     break
         if not name:
             return
-        name, ridx = strip_leading_row_index(name)
+        name, ridx = strip_row_index(name)
         if not looks_like_product(name):
             return
         item = {
@@ -753,50 +788,39 @@ def extract_table_items(lines: List[str], anchor_idx: int) -> List[Dict[str, Any
             item["farm_code"] = str(row_dict["farm_code"]).strip()
         if row_dict.get("raw_values"):
             item["raw_values"] = row_dict["raw_values"]
-        if ridx is not None:
-            item["row_index"] = ridx
+        ridx_final = row_dict.get("row_index", ridx)
+        if ridx_final is not None:
+            item["row_index"] = ridx_final
         items.append(item)
 
-    for line in lines[anchor_idx + 1:]:
-        s = line.strip()
-        if not s:
+    for row in data_rows:
+        rtext = row_text(row).strip()
+        if not rtext:
             continue
 
-        # A new header → restart column map
-        if is_table_header_line(s) and any(match_header(c) for c in split_columns(s)):
-            flush(pending_cells); pending_cells = []
-            headers = header_map_for(s)
+        # New header block? Restart column mapping
+        if header_score(rtext) > 0:
+            new_start, new_end, new_headers = stitch_header_rows([row])
+            if new_headers and sum(1 for h in new_headers if h and h != "row_index") >= 3:
+                flush(pending_cells)
+                pending_cells = None
+                headers = new_headers
+                cols = detect_column_gaps(data_rows, min_gap=10.0, min_cols=2) or cols
             continue
 
-        # Pure boilerplate outside table
-        if is_boilerplate(s):
+        if is_boilerplate(rtext):
+            continue
+        if re.match(r"^\s*(?:sub\s*total|grand\s*total|awb\s*fee|other\s*charges|"
+                    r"vat|tax|balance|amount\s+due|notes?|delivery|discount)\b",
+                    rtext, re.I):
             continue
 
-        cells = split_row_into_cells(s)
+        cells = assign_words_to_columns(row, cols)
+        has_num = any(is_numeric_cell(c) for c in cells)
+        has_lead_index = bool(re.match(r"^\d{1,3}[.)]?\s+", rtext))
 
-        # Single-cell wide-gap fallback: try to split numeric tokens off the right
-        if len(cells) == 1:
-            # Extract trailing numerics greedily
-            m = re.findall(
-                r"(?:[$€£]?\s*\d[\d,]*(?:\.\d+)?\s*(?:KES|USD|EUR|GBP|AED)?)",
-                s, re.IGNORECASE)
-            text_part = s
-            if m:
-                text_part = s
-                for tok in reversed(m):
-                    # cut from end
-                    idx = text_part.rfind(tok)
-                    if idx >= 0:
-                        text_part = text_part[:idx].rstrip()
-                text_part = text_part.strip(" -:,;")
-                cells = [text_part] + [tok.strip() for tok in m]
-
-        # If line has at least one numeric-looking cell, or a leading index, treat as new row
-        has_number = any(is_numeric_cell(c) for c in cells)
-        has_lead_index = bool(re.match(r"^\d{1,3}[.)]?\s+", s))
-
-        if pending_cells and not (has_number or has_lead_index):
-            # Continuation of previous row's description
+        # Continuation of a wrapped product row?
+        if pending_cells and not (has_num or has_lead_index):
             pending_cells[0] = (pending_cells[0] + " " + cells[0]).strip()
             continue
 
@@ -809,140 +833,383 @@ def extract_table_items(lines: List[str], anchor_idx: int) -> List[Dict[str, Any
 
 
 # ===========================================================================
-#  FREE-FORM FALLBACK (only used when no table found)
+#  TEXT-ONLY FALLBACK (no word positions available — e.g. PyPDF2 text)
 # ===========================================================================
 
-FIELD_PATTERNS = {
-    "boxes": r"(?:no\.?\s*of\s*)?(?:boxes?|bx|cartons?|ctn|cases?|bundles?|packages?)",
-    "pack_rate": r"(?:pack\s*rate|packrate|stems?\s*(?:per|/)\s*(?:box|carton)|"
-                 r"qty\s*(?:per|/)\s*(?:box|carton)|quantity\s*(?:per|/)\s*(?:box|carton))",
-    "quantity": r"(?:quantity|qty|qnty|total\s+qty|total\s+quantity|invoice\s+qty|"
-                r"invoice\s+quantity|stems?|pieces?|pcs|units?)",
-    "unit_price": r"(?:price\s*(?:per|/)\s*(?:stem|piece|unit)|price\s*per\s*stem|"
-                  r"price/stem|unit\s*price|unit\s*cost|rate\s*per\s*stem|"
-                  r"selling\s*price|cost\s*per\s*unit)",
-    "total": r"(?:line\s+total|total\s+amount|total\s+price|line\s+amount|"
-             r"extended\s+price|amount)",
-    "length": r"(?:length(?:\s*\(?(?:cm|cms)\)?)?|stem\s+length|size)\b",
-    "farm_code": r"(?:farm\s*code|farm\s*ref(?:erence)?|grower\s*code|supplier\s*code)",
+def extract_table_from_text(text: str) -> List[Dict[str, Any]]:
+    """
+    Text-only reconstruction: split into lines, find header block by
+    stitching, then row-by-row assignment using right-peel numeric parsing.
+    """
+    lines = [x.rstrip() for x in text.splitlines()]
+    # Find header block
+    h_start, h_end, headers = None, None, []
+    i = 0
+    while i < len(lines):
+        if header_score(lines[i]) > 0:
+            start = i
+            end = i + 1
+            while end < len(lines) and header_score(lines[end]) > 0:
+                end += 1
+            stitched = " ".join(lines[k] for k in range(start, end))
+            cols = header_columns_for(stitched)
+            mapped = [match_header(c) for c in cols]
+            known = [m for m in mapped if m and m != "row_index"]
+            if (any(k in known for k in ("product", "description", "variety"))
+                    and any(k in known for k in ("quantity", "total", "unit_price",
+                                                  "boxes", "pack_rate"))
+                    and len(set(known)) >= 3):
+                h_start, h_end, headers = start, end, mapped
+                break
+            i = end
+        else:
+            i += 1
+
+    if h_start is None:
+        return []
+
+    expected_cols = sum(1 for h in headers if h)
+
+    def split_row(s: str) -> List[str]:
+        s = s.strip()
+        if not s:
+            return []
+        if "|" in s:
+            parts = [p.strip() for p in re.split(r"\s*\|\s*", s) if p.strip()]
+            if len(parts) >= 2:
+                return parts
+        if "\t" in s:
+            parts = [p.strip() for p in s.split("\t") if p.strip()]
+            if len(parts) >= 2:
+                return parts
+        wide = [p.strip() for p in re.split(r"\s{2,}", s) if p.strip()]
+        if len(wide) >= max(2, expected_cols - 1):
+            return wide
+        # Right-peel bounded
+        cells: List[str] = []
+        remaining = s
+        for _ in range(expected_cols - 1):
+            m = re.search(
+                r"(?:\s|^)((?:[$€£]\s*)?\d{1,3}(?:[,\s]\d{3})*(?:\.\d+)?"
+                r"(?:\s*(?:KES|KSH|USD|EUR|GBP|AED|SAR|QAR))?)\s*$",
+                remaining, re.IGNORECASE,
+            )
+            if not m or m.start(1) == 0:
+                break
+            cells.insert(0, m.group(1).strip())
+            remaining = remaining[:m.start(1)].rstrip()
+        head = re.sub(r"^\d{1,3}[.)]?\s+", "", remaining).strip() if remaining else ""
+        return ([head] + cells) if cells else [s]
+
+    items: List[Dict[str, Any]] = []
+    pending: List[str] = []
+
+    def flush(cells):
+        if not cells or not any(c.strip() for c in cells):
+            return
+        row_dict = resolve_row_cells(cells, headers)
+        name = None
+        for key in ("product", "description", "variety"):
+            if row_dict.get(key) and looks_like_product(str(row_dict[key])):
+                name = str(row_dict[key]).strip()
+                break
+        if not name:
+            for c in cells:
+                if looks_like_product(c):
+                    name = c.strip()
+                    break
+        if not name:
+            return
+        name, ridx = strip_row_index(name)
+        if not looks_like_product(name):
+            return
+        item = {
+            "product_name": name,
+            "boxes": row_dict.get("boxes"),
+            "pack_rate": row_dict.get("pack_rate"),
+            "quantity": row_dict.get("quantity"),
+            "unit_price": row_dict.get("unit_price"),
+            "total": row_dict.get("total"),
+            "specification": row_dict.get("specification", {}) or {},
+        }
+        if row_dict.get("farm_code"):
+            item["farm_code"] = str(row_dict["farm_code"]).strip()
+        if row_dict.get("raw_values"):
+            item["raw_values"] = row_dict["raw_values"]
+        ridx_final = row_dict.get("row_index", ridx)
+        if ridx_final is not None:
+            item["row_index"] = ridx_final
+        items.append(item)
+
+    for line in lines[h_end:]:
+        s = line.strip()
+        if not s:
+            continue
+        if header_score(s) > 0:
+            # New header block — rebuild
+            start = lines.index(line)
+            end = start + 1
+            while end < len(lines) and header_score(lines[end]) > 0:
+                end += 1
+            stitched = " ".join(lines[k] for k in range(start, end))
+            new_headers = [match_header(c) for c in header_columns_for(stitched)]
+            if sum(1 for h in new_headers if h and h != "row_index") >= 3:
+                flush(pending); pending = []
+                headers = new_headers
+                expected_cols = sum(1 for h in headers if h)
+            continue
+
+        if is_boilerplate(s):
+            continue
+        if re.match(r"^\s*(?:sub\s*total|grand\s*total|awb\s*fee|other\s*charges|"
+                    r"vat|tax|balance|amount\s+due|notes?|delivery|discount)\b",
+                    s, re.I):
+            continue
+
+        cells = split_row(s)
+        has_num = any(is_numeric_cell(c) for c in cells)
+        has_lead_index = bool(re.match(r"^\d{1,3}[.)]?\s+", s))
+
+        if pending and not (has_num or has_lead_index):
+            pending[0] = (pending[0] + " " + cells[0]).strip()
+            continue
+
+        if pending:
+            flush(pending)
+        pending = cells
+
+    flush(pending)
+    return items
+
+
+# ===========================================================================
+#  METADATA EXTRACTION
+# ===========================================================================
+
+CURRENCY_WORDS = {
+    "usd": "USD", "us dollar": "USD", "dollar": "USD",
+    "kes": "KES", "ksh": "KES", "kenya shilling": "KES",
+    "eur": "EUR", "euro": "EUR", "gbp": "GBP", "pound": "GBP",
+    "aed": "AED", "sar": "SAR", "qar": "QAR",
 }
 
 
-def extract_labeled_fields(line: str) -> Dict[str, Any]:
-    result: Dict[str, Any] = {}
-    for field in ("pack_rate", "unit_price", "farm_code", "quantity",
-                  "boxes", "length", "total"):
-        pat = FIELD_PATTERNS[field]
-        m = re.search(rf"\b{pat}\b\s*(?:[:=]\s*|\s+)([^|,;]+)", line, re.I)
-        if not m:
-            continue
-        raw = m.group(1).strip()
-        nxt = re.search(r"\s+(?:pack\s*rate|packrate|qty|quantity|boxes?|"
-                        r"cartons?|price|unit\s*price|total|farm\s*code|length)\b",
-                        raw, re.I)
-        if nxt:
-            raw = raw[:nxt.start()].strip()
-        if field in {"boxes", "pack_rate", "quantity", "unit_price", "total"}:
-            v = parse_number(raw)
-            if v is not None:
-                result[field] = as_number(v)
-        elif field == "length":
-            lm = re.search(r"\d+(?:\.\d+)?", raw)
-            if lm:
-                result["specification"] = {"length": f"{lm.group(0)}cm"}
-        elif field == "farm_code":
-            parts = raw.split()
-            if parts:
-                result["farm_code"] = parts[0]
-    return result
+def detect_document_type(text: str) -> Optional[str]:
+    low = norm(text[:12000])
+    scores = {t: max([fuzz.partial_ratio(low, norm(w)) for w in ws] or [0])
+              for t, ws in DOC_TYPES.items()}
+    typ, score = max(scores.items(), key=lambda x: x[1])
+    return typ if score >= 70 else None
 
 
-def strip_known_annotations(name: str) -> str:
-    s = name
-    for pat in [
-        r"\bpack\s*rate\b\s*[:=]?\s*[\d,.]+",
-        r"\bpackrate\b\s*[:=]?\s*[\d,.]+",
-        r"\b(?:qty|quantity|qnty)\b\s*[:=]?\s*[\d,.]+",
-        r"\b(?:boxes?|bx|cartons?|ctn)\b\s*[:=]?\s*[\d,.]+",
-        r"\b(?:price|rate|unit\s*price|price\s*/\s*stem|price\s*per\s*stem)"
-        r"\b\s*[:=@]?\s*[\d,.]+",
-        r"\b(?:total|amount)\b\s*[:=]?\s*[\d,.]+",
-        r"\b\d+(?:\.\d+)?\s*cm\b",
-    ]:
-        s = re.sub(pat, " ", s, flags=re.I)
-    s = re.sub(r"(?i)(?<=\d)\s*(?:usd|us\$|kes|ksh|eur|gbp|aed|sar|qar)\b", " ", s)
-    s = re.sub(r"[\$€£]", " ", s)
-    return re.sub(r"\s+", " ", s).strip(" -:,;.|")
-
-
-def parse_inline_line(line: str) -> Optional[Dict[str, Any]]:
-    s = line.strip()
-    if not s or is_boilerplate(s) or is_contact_or_address(s):
-        return None
-    if is_table_header_line(s):
-        return None
-    fields = extract_labeled_fields(s)
-    if "boxes" not in fields:
-        m = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:boxes?|bx|cartons?|ctn)\b", s, re.I)
+def extract_meta_from_text(text: str) -> Dict[str, Any]:
+    meta: Dict[str, Any] = {}
+    lines = [x.strip() for x in text.splitlines() if x.strip()]
+    for i, line in enumerate(lines):
+        m = re.match(
+            r"^\s*([A-Za-z][A-Za-z0-9\s./()%#*&_-]{1,70}?)\s*"
+            r"(?:[:#]\s*|-\s+|\|\s*)(.*?)\s*$", line)
         if m:
-            fields["boxes"] = as_number(m.group(1))
-    if "specification" not in fields:
-        m = re.search(r"\b(\d+(?:\.\d+)?)\s*cm\b", s, re.I)
-        if m:
-            fields["specification"] = {"length": f"{m.group(1)}cm"}
-    name = strip_known_annotations(s)
-    name = re.sub(r"^(\d{1,3})[.)]?\s+", "", name)  # strip leading index
-    if not looks_like_product(name):
-        return None
-    item = {
-        "product_name": name.strip(),
-        "boxes": fields.get("boxes"),
-        "pack_rate": fields.get("pack_rate"),
-        "quantity": fields.get("quantity"),
-        "unit_price": fields.get("unit_price"),
-        "total": fields.get("total"),
-        "specification": fields.get("specification", {}) or {},
-    }
-    if fields.get("farm_code"):
-        item["farm_code"] = fields["farm_code"]
-    return item
-
-
-# ===========================================================================
-#  TOP-LEVEL TEXT PARSER (table-first)
-# ===========================================================================
-
-def parse_order_text(text: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    text = clean_ocr_text(text)
-    lines = [x.rstrip() for x in text.splitlines()]
-    meta = extract_meta_from_text(text)
-
-    anchor = find_table_anchor(lines)
-    if anchor is not None:
-        table_items = extract_table_items(lines, anchor)
-        if table_items:
-            return clean_items(table_items), meta
-
-    # Fallback (only reached when no table header was detected)
-    items = []
-    for line in lines:
-        s = line.strip()
-        if not s or len(s) < 3:
-            continue
-        if is_boilerplate(s) or is_contact_or_address(s):
-            continue
-        if re.match(r"^[A-Za-z][A-Za-z0-9\s./()%#*&_-]{1,70}\s*[:#]", s):
-            if match_meta_label(re.split(r"[:#]", s, 1)[0]):
+            label, value = m.group(1), m.group(2).strip()
+            field = match_meta_label(label)
+            if field and value and not empty_field(value):
+                meta[field] = value
                 continue
-        item = parse_inline_line(s)
-        if item:
-            items.append(item)
+        field = match_meta_label(line.rstrip(":#"))
+        if field and i + 1 < len(lines):
+            nxt = lines[i + 1]
+            if nxt and not match_meta_label(nxt) and not re.match(r"^[A-Za-z].*[:#]", nxt):
+                if field not in meta:
+                    meta[field] = nxt
 
-    return clean_items(items), meta
+    if "currency" in meta:
+        c = norm(meta["currency"])
+        for word, code in CURRENCY_WORDS.items():
+            if word in c:
+                meta["currency"] = code
+                break
+    else:
+        for word, code in CURRENCY_WORDS.items():
+            if re.search(rf"\b{word}\b", norm(text)):
+                meta["currency"] = code
+                break
+
+    # Hash IDs like #CR-2026-000006
+    if "invoice_number" not in meta:
+        m = re.search(r"#\s*([A-Z]{2,}-?\d{4,}[A-Z0-9\-]*)", text)
+        if m:
+            meta["invoice_number"] = m.group(1)
+
+    meta["document_type"] = detect_document_type(text)
+    return meta
 
 
 # ===========================================================================
-#  EXCEL / CSV  (table-aware by construction)
+#  BINARY INPUTS — PDF / DOCX / XLSX / IMAGES
+# ===========================================================================
+
+def _pymupdf_words(content: bytes) -> Tuple[List[Word], str]:
+    """Extract word tokens with positions from a PDF. Returns (words, raw_text)."""
+    if fitz is None:
+        return [], ""
+    try:
+        doc = fitz.open(stream=content, filetype="pdf")
+    except Exception:
+        return [], ""
+    words: List[Word] = []
+    text_chunks: List[str] = []
+    try:
+        for page_no, page in enumerate(doc):
+            for w in page.get_text("words"):
+                # w = (x0, y0, x1, y1, text, block_no, line_no, word_no)
+                x0, y0, x1, y1, txt = w[0], w[1], w[2], w[3], w[4]
+                if txt and txt.strip():
+                    words.append(Word(txt, x0, y0, x1, y1, page=page_no))
+            text_chunks.append(page.get_text("text") or "")
+    except Exception:
+        logger.exception("PyMuPDF word extraction failed")
+    return words, "\n".join(text_chunks)
+
+
+def _pypdf2_text(content: bytes) -> str:
+    parts = []
+    try:
+        reader = PyPDF2.PdfReader(io.BytesIO(content))
+        for page in reader.pages:
+            try:
+                parts.append(page.extract_text() or "")
+            except Exception:
+                pass
+    except Exception:
+        logger.warning("PyPDF2 failed")
+    return "\n".join(parts).strip()
+
+
+def _preprocess_image(img: Image.Image) -> Image.Image:
+    img = img.convert("L")
+    w, h = img.size
+    if max(w, h) > 2400:
+        s = 2400 / max(w, h)
+        img = img.resize((int(w * s), int(h * s)))
+    elif max(w, h) < 1400:
+        s = 1400 / max(w, h)
+        img = img.resize((int(w * s), int(h * s)))
+    img = ImageEnhance.Contrast(img).enhance(1.6)
+    return img
+
+
+def _ocr_image(img: Image.Image) -> str:
+    processed = _preprocess_image(img)
+    results = []
+    for cfg in ("--oem 3 --psm 6", "--oem 3 --psm 4"):
+        try:
+            t = pytesseract.image_to_string(processed, lang="eng",
+                                            config=cfg, timeout=30)
+            if t:
+                results.append(t)
+        except Exception as e:
+            logger.warning("OCR failed (%s): %s", cfg, e)
+    return max(results, key=lambda x: len(re.findall(r"[A-Za-z0-9]", x))) if results else ""
+
+
+def _docx_text(content: bytes) -> str:
+    try:
+        d = docx.Document(io.BytesIO(content))
+        parts = []
+        for p in d.paragraphs:
+            if p.text.strip():
+                parts.append(p.text)
+        for table in d.tables:
+            for row in table.rows:
+                cells = [c.text.strip() for c in row.cells]
+                if any(cells):
+                    parts.append(" | ".join(cells))
+        return "\n".join(parts)
+    except Exception:
+        logger.exception("DOCX failed")
+        return ""
+
+
+def _extract_words_from_image(img: Image.Image) -> List[Word]:
+    """OCR with word bounding boxes so we can run the layout engine."""
+    processed = _preprocess_image(img)
+    try:
+        data = pytesseract.image_to_data(
+            processed, lang="eng", config="--oem 3 --psm 6",
+            output_type=pytesseract.Output.DICT, timeout=45)
+    except Exception:
+        return []
+    words: List[Word] = []
+    n = len(data.get("text", []))
+    for i in range(n):
+        txt = (data["text"][i] or "").strip()
+        if not txt:
+            continue
+        try:
+            conf = float(data["conf"][i])
+        except (ValueError, TypeError):
+            conf = 0.0
+        if conf < 20:
+            continue
+        x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
+        words.append(Word(txt, x, y, x + w, y + h, page=0))
+    return words
+
+
+def extract_words_and_text(content: bytes, ext: str) -> Tuple[List[Word], str, str]:
+    """Return (words, text, method)."""
+    if ext == "pdf":
+        words, txt = _pymupdf_words(content)
+        if words:
+            return words, txt, "pdf_layout"
+        txt = _pypdf2_text(content)
+        if len(re.sub(r"\s+", "", txt)) >= 15:
+            return [], txt, "pdf_text"
+        # OCR path
+        if fitz is None:
+            return [], txt, "pdf_text_empty"
+        try:
+            doc = fitz.open(stream=content, filetype="pdf")
+            all_words: List[Word] = []
+            texts: List[str] = []
+            for idx, page in enumerate(doc):
+                if idx >= 10:
+                    break
+                pix = page.get_pixmap(matrix=fitz.Matrix(1.6, 1.6), alpha=False)
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                all_words.extend(_extract_words_from_image(img))
+                texts.append(_ocr_image(img))
+            return all_words, "\n".join(texts), "pdf_ocr"
+        except Exception:
+            logger.exception("PDF OCR failed")
+            return [], txt, "pdf_text_empty"
+
+    if ext in ("jpg", "jpeg", "png", "gif", "bmp", "tiff", "webp"):
+        try:
+            img = Image.open(io.BytesIO(content))
+            words = _extract_words_from_image(img)
+            txt = _ocr_image(img)
+            return words, txt, "image_ocr"
+        except Exception:
+            logger.exception("Image failed")
+            return [], "", "image_error"
+
+    if ext in ("docx", "doc"):
+        return [], _docx_text(content), "docx"
+
+    if ext == "json":
+        try:
+            obj = json.loads(content.decode("utf-8", errors="ignore"))
+            return [], json.dumps(obj, ensure_ascii=False, indent=2), "json"
+        except Exception:
+            return [], content.decode("utf-8", errors="ignore"), "text"
+
+    # Plain text fallback
+    return [], content.decode("utf-8", errors="ignore"), "text"
+
+
+# ===========================================================================
+#  SPREADSHEET PATH
 # ===========================================================================
 
 def find_excel_header(df: pd.DataFrame) -> Tuple[Optional[int], Dict[int, str]]:
@@ -990,7 +1257,7 @@ def extract_from_dataframe(df: pd.DataFrame) -> Tuple[List[Dict[str, Any]], Dict
                 break
         if not name:
             continue
-        name, ridx = strip_leading_row_index(name)
+        name, ridx = strip_row_index(name)
         item = {
             "product_name": name,
             "boxes": as_number(vals.get("boxes")),
@@ -1013,7 +1280,7 @@ def extract_from_dataframe(df: pd.DataFrame) -> Tuple[List[Dict[str, Any]], Dict
     return clean_items(items), {}
 
 
-def extract_from_excel(content: bytes, ext: str):
+def extract_from_spreadsheet(content: bytes, ext: str):
     try:
         if ext == "csv":
             try:
@@ -1026,104 +1293,6 @@ def extract_from_excel(content: bytes, ext: str):
     except Exception as e:
         logger.exception("Spreadsheet read failed")
         return [], {"error": str(e)}
-
-
-# ===========================================================================
-#  BINARY TEXT EXTRACTION
-# ===========================================================================
-
-def extract_text_from_pdf(content: bytes) -> Tuple[str, str]:
-    text_parts = []
-    try:
-        reader = PyPDF2.PdfReader(io.BytesIO(content))
-        for page in reader.pages:
-            try:
-                text_parts.append(page.extract_text() or "")
-            except Exception:
-                pass
-    except Exception as e:
-        logger.warning("PyPDF2 failed: %s", e)
-    text = "\n".join(text_parts).strip()
-    if len(re.sub(r"\s+", "", text)) >= 30:
-        return text, "pdf_text"
-    if fitz is None:
-        return text, "pdf_text_empty_or_short"
-    try:
-        doc = fitz.open(stream=content, filetype="pdf")
-        parts = []
-        for page in doc:
-            pix = page.get_pixmap(matrix=fitz.Matrix(2.5, 2.5), alpha=False)
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            parts.append(ocr_image(img))
-        return "\n".join(parts), "pdf_ocr"
-    except Exception:
-        logger.exception("PDF OCR failed")
-        return text, "pdf_text"
-
-
-def extract_text_from_docx(content: bytes) -> str:
-    try:
-        d = docx.Document(io.BytesIO(content))
-        parts = []
-        for p in d.paragraphs:
-            if p.text.strip():
-                parts.append(p.text)
-        for table in d.tables:
-            for row in table.rows:
-                cells = [c.text.strip() for c in row.cells]
-                if any(cells):
-                    parts.append(" | ".join(cells))
-        return "\n".join(parts)
-    except Exception:
-        logger.exception("DOCX failed")
-        return ""
-
-
-def preprocess_image(img: Image.Image) -> Image.Image:
-    img = img.convert("RGB")
-    w, h = img.size
-    if max(w, h) < 1800:
-        scale = min(2.5, 1800 / max(w, h))
-        img = img.resize((int(w * scale), int(h * scale)))
-    gray = ImageOps.grayscale(img)
-    gray = ImageEnhance.Contrast(gray).enhance(1.7)
-    gray = ImageEnhance.Sharpness(gray).enhance(1.4)
-    gray = gray.filter(ImageFilter.MedianFilter(size=3))
-    return gray
-
-
-def ocr_image(img: Image.Image) -> str:
-    processed = preprocess_image(img)
-    configs = ["--oem 3 --psm 6", "--oem 3 --psm 4",
-               "--oem 3 --psm 11", "--oem 3 --psm 3"]
-    results = []
-    for cfg in configs:
-        try:
-            t = pytesseract.image_to_string(processed, lang="eng", config=cfg)
-            if t:
-                results.append(t)
-        except Exception as e:
-            logger.warning("OCR config failed: %s", e)
-    if not results:
-        return ""
-    return max(results, key=lambda x: len(re.findall(r"[A-Za-z0-9]", x)))
-
-
-def extract_text_from_image(content: bytes) -> Tuple[str, str]:
-    try:
-        img = Image.open(io.BytesIO(content))
-        return ocr_image(img), "image_ocr"
-    except Exception:
-        logger.exception("Image extraction failed")
-        return "", "image_error"
-
-
-def extract_text_from_json(content: bytes) -> Tuple[str, str]:
-    try:
-        obj = json.loads(content.decode("utf-8", errors="ignore"))
-        return json.dumps(obj, ensure_ascii=False, indent=2), "json"
-    except Exception:
-        return content.decode("utf-8", errors="ignore"), "text"
 
 
 # ===========================================================================
@@ -1142,15 +1311,13 @@ def validate_item(item: Dict[str, Any]) -> List[str]:
     if t is not None and t < 0: w.append("total_negative")
     if q and u and t:
         try:
-            exp = float(q) * float(u)
-            if abs(exp - float(t)) > max(0.02, abs(float(t)) * 0.02):
+            if abs(float(q) * float(u) - float(t)) > max(0.05, abs(float(t)) * 0.02):
                 w.append("quantity_x_unit_price_does_not_match_total")
         except Exception:
             pass
     if b and p and q:
         try:
-            exp = float(b) * float(p)
-            if abs(exp - float(q)) > 0.5:
+            if abs(float(b) * float(p) - float(q)) > 0.5:
                 w.append("boxes_x_pack_rate_does_not_match_quantity")
         except Exception:
             pass
@@ -1199,7 +1366,6 @@ def clean_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if out["quantity"] is None: conf -= 0.04
         if out["unit_price"] is None: conf -= 0.04
         if out.get("raw_values"): conf -= 0.10
-
         warns = validate_item(out)
         conf -= min(0.30, 0.08 * len(warns))
         out["confidence"] = round(max(0.0, min(1.0, conf)), 3)
@@ -1231,6 +1397,8 @@ FLOWER_FAMILIES = {
     "ruscus": ["ruscus"],
     "leather_leaf": ["leather leaf", "leatherleaf"],
     "hydrangea": ["hydrangea", "hydringa"],
+    "sunflower": ["sunflower", "sunflowers", "sunflowers"],
+    "eustoma": ["eustoma", "lisianthus"],
 }
 
 
@@ -1255,6 +1423,7 @@ def ai_analyze(items, meta):
     if not items:
         insights.append({"type": "no_items_detected", "severity": "high",
                          "message": "No line items could be extracted."})
+
     prices = [float(i["unit_price"]) for i in items if i.get("unit_price")]
     if len(prices) >= 3:
         med = statistics.median(prices)
@@ -1267,19 +1436,30 @@ def ai_analyze(items, meta):
                                  "item_index": i,
                                  "product_name": it.get("product_name"),
                                  "message": f"Unit price {p} deviates {dev*100:.0f}% from median ({med:.2f})."})
+
+    missing_price = [i for i in items if i.get("unit_price") is None]
+    if missing_price:
+        insights.append({"type": "missing_unit_prices", "severity": "medium",
+                         "count": len(missing_price),
+                         "message": f"{len(missing_price)} item(s) lack a unit price."})
+
     for i, it in enumerate(items):
         for w in it.get("warnings", []):
             anomalies.append({"item_index": i,
                               "product_name": it.get("product_name"),
                               "code": w,
                               "severity": "high" if "not_match" in w else "medium"})
+
     recs = []
     if any(i["type"] == "no_items_detected" for i in insights):
         recs.append("Re-upload a higher-resolution scan.")
     if any(i["type"] == "price_outlier" for i in insights):
         recs.append("Cross-check outlier prices against your rate card.")
+    if any(i["type"] == "missing_unit_prices" for i in insights):
+        recs.append("Confirm document type — packing lists typically carry no prices.")
     if not recs:
         recs.append("Extraction looks consistent. Proceed to product matching.")
+
     trust_base = (sum(i.get("confidence", 0.5) for i in items) / len(items)) if items else 0.0
     penalty = sum(0.10 if x.get("severity") == "high" else
                   0.04 if x.get("severity") == "medium" else
@@ -1348,6 +1528,131 @@ async def match_products_endpoint(req: MatchRequest):
 
 
 # ===========================================================================
+#  ORCHESTRATION
+# ===========================================================================
+
+def _run_pipeline(content: bytes, fname: str, ext: str) -> Dict[str, Any]:
+    """All blocking work happens here. Runs in a thread pool."""
+    if ext in ("xlsx", "xls", "xlsm", "csv"):
+        items, meta = extract_from_spreadsheet(content, ext)
+        return {
+            "items": items, "metadata": meta or {},
+            "text_extracted": "", "extraction_method": "spreadsheet",
+        }
+
+    words, text, method = extract_words_and_text(content, ext)
+
+    meta: Dict[str, Any] = {}
+    items: List[Dict[str, Any]] = []
+
+    # Path A — Layout engine (best quality, needs word positions)
+    if words:
+        rows = cluster_rows(words, y_tol=4.0)
+        items = reconstruct_table_from_grid(rows)
+        # Metadata still comes from the raw text
+        meta = extract_meta_from_text(text)
+
+    # Path B — Text-only table reconstruction
+    if not items and text:
+        items = extract_table_from_text(text)
+        if not meta:
+            meta = extract_meta_from_text(text)
+
+    # Path C — Last resort: inline free-form (only if the doc has no table)
+    if not items and text:
+        for line in text.splitlines():
+            s = line.strip()
+            if not s or len(s) < 3:
+                continue
+            if is_boilerplate(s) or is_contact_or_address(s):
+                continue
+            # strip leading index then try to peel numerics
+            head, ridx = strip_row_index(s)
+            cells = [head]
+            remaining = s
+            for _ in range(6):
+                m = re.search(
+                    r"(?:\s|^)((?:[$€£]\s*)?\d{1,3}(?:[,\s]\d{3})*(?:\.\d+)?"
+                    r"(?:\s*(?:KES|KSH|USD|EUR|GBP|AED|SAR|QAR))?)\s*$",
+                    remaining, re.IGNORECASE)
+                if not m or m.start(1) == 0:
+                    break
+                cells.insert(1, m.group(1).strip())
+                remaining = remaining[:m.start(1)].rstrip()
+            name = head.strip()
+            if looks_like_product(name) and len(cells) > 1:
+                items.append({
+                    "product_name": name,
+                    "boxes": None, "pack_rate": None, "quantity": None,
+                    "unit_price": None, "total": None,
+                    "specification": {}, "raw_values": {"unparsed": cells[1:]},
+                })
+
+    cleaned = clean_items(items)
+    return {
+        "items": cleaned, "metadata": meta,
+        "text_extracted": text, "extraction_method": method,
+    }
+
+
+def _analyze_sync(content: bytes, fname: str, ext: str) -> Dict[str, Any]:
+    pipeline = _run_pipeline(content, fname, ext)
+
+    routed: List[Dict[str, Any]] = []
+    for raw in pipeline["items"]:
+        try:
+            v = ExtractedLineItem(**raw)
+            d = v.model_dump()
+            d["flower_family"] = infer_flower_family(d["product_name"])
+            d["confidence_band"] = confidence_band(d["confidence"])
+            routed.append(d)
+        except Exception as e:
+            logger.warning("Item failed strict routing: %s", e)
+
+    total_boxes = int(sum(float(x.get("boxes") or 0) for x in routed)) or None
+    total_qty = int(sum(float(x.get("quantity") or 0) for x in routed)) or None
+    total_amount = round(sum(float(x.get("total") or 0) for x in routed), 2)
+
+    warnings = []
+    for x in routed:
+        warnings.extend(x.get("validation_warnings", []))
+
+    meta = pipeline["metadata"]
+    analysis = ai_analyze(routed, meta)
+
+    return {
+        "success": True,
+        "items": routed,
+        "metadata": meta,
+        "document_type": meta.get("document_type"),
+        "total_boxes": total_boxes,
+        "total_quantity": total_qty,
+        "total_amount": total_amount,
+        "currency": meta.get("currency", "USD"),
+        "item_count": len(routed),
+        "review_required": any(x.get("confidence", 0) < 0.80 or
+                               x.get("validation_warnings") for x in routed),
+        "warnings": sorted(set(warnings)),
+        "analysis": analysis,
+        "text_extracted": (pipeline["text_extracted"] or "")[:12000],
+        "extraction_method": pipeline["extraction_method"],
+        "file_type": ext,
+        "filename": fname,
+        "engine_version": ENGINE_VERSION,
+    }
+
+
+def _run_with_timeout(fn, *args, timeout=ANALYZE_TIMEOUT_SECONDS):
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(fn, *args)
+        try:
+            return fut.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            raise HTTPException(status_code=504,
+                detail=f"Extraction exceeded {timeout}s. Try a smaller file or a text-based PDF.")
+
+
+# ===========================================================================
 #  ENDPOINTS
 # ===========================================================================
 
@@ -1355,121 +1660,71 @@ async def match_products_endpoint(req: MatchRequest):
 async def root():
     return {"service": "Smart Document Intelligence Engine",
             "version": ENGINE_VERSION, "status": "operational",
-            "capabilities": ["structured_table_extraction", "multi_line_row_stitching",
-                             "boilerplate_rejection", "contact_and_link_filtering",
-                             "row_index_stripping", "confidence_scoring",
-                             "anomaly_detection", "trust_score",
-                             "product_matching", "currency_detection"],
-            "endpoints": ["/api/health", "/api/analyze (POST)",
+            "capabilities": [
+                "layout_aware_extraction", "table_grid_reconstruction",
+                "multi_line_row_stitching", "semantic_row_tagging",
+                "boilerplate_suppression", "currency_detection",
+                "confidence_scoring", "anomaly_detection", "trust_score",
+                "product_matching", "pdf_layout", "pdf_text", "pdf_ocr",
+                "image_ocr", "docx", "xlsx", "csv", "json", "text",
+            ],
+            "endpoints": ["/api/health", "/api/ping", "/api/analyze (POST)",
                           "/api/match-products (POST)", "/api/extract-text (POST)"]}
 
 
 @app.get("/api/health")
-async def health():
+def health():
     return {"status": "healthy", "service": "smart-import-engine",
             "version": ENGINE_VERSION,
             "ocr_available": bool(pytesseract),
-            "scanned_pdf_ocr_available": fitz is not None}
+            "pdf_layout_available": fitz is not None}
+
+
+@app.get("/api/ping")
+def ping():
+    return {"ok": True, "t": datetime.utcnow().isoformat() + "Z"}
+
+
+@app.on_event("startup")
+def _warmup():
+    try:
+        pytesseract.get_tesseract_version()
+    except Exception:
+        pass
 
 
 @app.post("/api/analyze")
 async def analyze(file: UploadFile = File(...),
                   company_id: int = Form(0),
                   file_type: Optional[str] = Form(None)):
-    try:
-        content = await file.read()
-        if len(content) > MAX_UPLOAD_MB * 1024 * 1024:
-            raise HTTPException(status_code=413,
-                                detail=f"File is larger than {MAX_UPLOAD_MB} MB.")
-        fname = file.filename or "upload"
-        ext = (file_type or Path(fname).suffix.lstrip(".")).lower()
-        logger.info("Processing %s (%s), company=%s, size=%s",
-                    fname, ext, company_id, len(content))
+    content = await file.read()
+    if len(content) > MAX_UPLOAD_MB * 1024 * 1024:
+        raise HTTPException(status_code=413,
+                            detail=f"File is larger than {MAX_UPLOAD_MB} MB.")
+    fname = file.filename or "upload"
+    ext = (file_type or Path(fname).suffix.lstrip(".")).lower()
 
-        items, metadata, text_extracted, method = [], {}, "", ""
-        if ext in ("xlsx", "xls", "xlsm", "csv"):
-            items, metadata = extract_from_excel(content, ext)
-            method = "spreadsheet"
-        elif ext == "pdf":
-            text_extracted, method = extract_text_from_pdf(content)
-            items, metadata = parse_order_text(text_extracted)
-        elif ext in ("docx", "doc"):
-            text_extracted = extract_text_from_docx(content); method = "docx"
-            items, metadata = parse_order_text(text_extracted)
-        elif ext in ("jpg", "jpeg", "png", "gif", "bmp", "tiff", "webp"):
-            text_extracted, method = extract_text_from_image(content)
-            items, metadata = parse_order_text(text_extracted)
-        elif ext == "json":
-            text_extracted, method = extract_text_from_json(content)
-            items, metadata = parse_order_text(text_extracted)
-        else:
-            text_extracted = content.decode("utf-8", errors="ignore"); method = "text"
-            items, metadata = parse_order_text(text_extracted)
+    logger.info("Processing %s (%s), company=%s, size=%s",
+                fname, ext, company_id, len(content))
 
-        cleaned = clean_items(items)
-
-        routed = []
-        for raw in cleaned:
-            try:
-                v = ExtractedLineItem(**raw)
-                d = v.model_dump()
-                d["flower_family"] = infer_flower_family(d["product_name"])
-                d["confidence_band"] = confidence_band(d["confidence"])
-                routed.append(d)
-            except Exception as e:
-                logger.warning("Item failed strict routing: %s", e)
-
-        total_boxes = int(sum(float(x.get("boxes") or 0) for x in routed)) or None
-        total_qty = int(sum(float(x.get("quantity") or 0) for x in routed)) or None
-        total_amount = round(sum(float(x.get("total") or 0) for x in routed), 2)
-
-        warnings: List[str] = []
-        for x in routed:
-            warnings.extend(x.get("validation_warnings", []))
-
-        analysis = ai_analyze(routed, metadata)
-
-        return {"success": True, "items": routed, "metadata": metadata,
-                "document_type": metadata.get("document_type"),
-                "total_boxes": total_boxes, "total_quantity": total_qty,
-                "total_amount": total_amount,
-                "currency": metadata.get("currency", "USD"),
-                "item_count": len(routed),
-                "review_required": any(x.get("confidence", 0) < 0.80 or
-                                       x.get("validation_warnings") for x in routed),
-                "warnings": sorted(set(warnings)),
-                "analysis": analysis,
-                "text_extracted": text_extracted[:12000] if text_extracted else "",
-                "extraction_method": method, "file_type": ext,
-                "filename": fname, "engine_version": ENGINE_VERSION}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("Analyze failed")
-        raise HTTPException(status_code=500, detail=str(e))
+    result = await run_in_threadpool(_run_with_timeout, _analyze_sync,
+                                     content, fname, ext)
+    return result
 
 
 @app.post("/api/extract-text")
 async def extract_text_endpoint(file: UploadFile = File(...)):
-    try:
-        content = await file.read()
-        fname = file.filename or ""
-        ext = Path(fname).suffix.lstrip(".").lower()
-        if ext == "pdf":
-            text, method = extract_text_from_pdf(content)
-        elif ext in ("docx", "doc"):
-            text, method = extract_text_from_docx(content), "docx"
-        elif ext in ("jpg", "jpeg", "png", "gif", "bmp", "tiff", "webp"):
-            text, method = extract_text_from_image(content)
-        elif ext == "json":
-            text, method = extract_text_from_json(content)
-        else:
-            text, method = content.decode("utf-8", errors="ignore"), "text"
+    content = await file.read()
+    fname = file.filename or ""
+    ext = Path(fname).suffix.lstrip(".").lower()
+
+    def _work():
+        words, text, method = extract_words_and_text(content, ext)
         return {"success": True, "text": text, "length": len(text),
-                "file_type": ext, "extraction_method": method}
-    except Exception as e:
-        logger.exception("extract-text failed")
-        raise HTTPException(status_code=500, detail=str(e))
+                "file_type": ext, "extraction_method": method,
+                "word_count": len(words)}
+
+    return await run_in_threadpool(_work)
 
 
 if __name__ == "__main__":
