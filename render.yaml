@@ -1,14 +1,21 @@
 services:
   - type: web
-    name: invg-smart-document-engine
+    name: smart-document-engine
     runtime: docker
+    region: oregon
+    plan: free
+    healthCheckPath: /api/ping
     dockerfilePath: ./Dockerfile
     envVars:
       - key: MAX_UPLOAD_MB
         value: "25"
-      - key: ANALYZE_TIMEOUT_SECONDS
-        value: "55"
-      - key: MIN_PRODUCT_MATCH
+      - key: MAX_PDF_PAGES
+        value: "30"
+      - key: MAX_OCR_PAGES
+        value: "12"
+      - key: OCR_DPI
+        value: "150"
+      - key: MIN_MATCH_CONFIDENCE
         value: "0.84"
       - key: CORS_ORIGINS
         value: "*"
