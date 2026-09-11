@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: invg-smart-document-engine
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: MAX_UPLOAD_MB
+        value: "25"
+      - key: ANALYZE_TIMEOUT_SECONDS
+        value: "55"
+      - key: MIN_PRODUCT_MATCH
+        value: "0.84"
+      - key: CORS_ORIGINS
+        value: "*"
