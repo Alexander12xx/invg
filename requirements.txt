@@ -12,3 +12,5 @@ rapidfuzz==3.11.0
 pydantic==2.10.6
 python-multipart==0.0.20
 numpy==2.2.2
+google-generativeai==0.8.3
+groq==0.11.0
