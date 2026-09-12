@@ -9,26 +9,28 @@ Design:
 The engine NEVER invents values. Every operation either transforms an
 existing value with a deterministic formula or leaves it alone.
 
+NEW in this revision:
+  • Wildcard row filters: "all", "every", "everything", "all rows",
+    "all flowers", "the whole list" match EVERY row.
+  • Compound commands: "do X and then Y" runs X, then runs Y on the result.
+    Splits on " and ", " then ", " ; ", " & " — but only when each piece
+    looks like a real command.
+
 Supported Tier 1 operations (many phrasings each):
-  • set unit price on matching rows
+  • set unit price on matching rows (incl. all rows)
   • calculate line totals
-  • add a computed column (line total, quantity × price)
   • remove a column
-  • remove rows (by filter, by zero quantity, by missing price, empty rows)
+  • remove rows (by filter, zero quantity, missing price, empty rows)
   • multiply a numeric column by a factor
   • apply a percentage discount
   • increase prices by a percentage
   • add a fixed amount to prices
   • sort by a column
-  • clear all prices
-  • clear a column's values
+  • clear all prices / a column
   • round a numeric column to N decimals
-  • set a column to a constant value for matching rows
+  • set a column to a constant value
   • rename a column
-  • count rows
-  • total / sum of a column
-  • group totals (sum by <column>)
-  • read-only questions ("how many X?", "total amount?")
+  • read-only questions
 """
 
 import os
@@ -52,7 +54,33 @@ NUMERIC_ROLES = {"quantity", "boxes", "pack_rate", "length_cm",
 
 STOPWORDS = {"a", "an", "the", "of", "to", "for", "all", "and", "or",
              "is", "are", "on", "in", "at", "by", "with", "as", "please",
-             "add", "set", "apply", "give", "assign", "each"}
+             "add", "set", "apply", "give", "assign", "each", "then",
+             "every", "everything", "row", "rows"}
+
+# Wildcards that match every row
+WILDCARD_PHRASES = {
+    "all", "every", "everything", "each", "any", "all rows", "every row",
+    "all flowers", "all items", "all entries", "all lines", "the whole list",
+    "the entire list", "every flower", "every item", "everything here",
+    "the whole thing", "the entire table", "all products",
+}
+
+
+def is_wildcard(target: str) -> bool:
+    """Return True if the target should match every row."""
+    if not target:
+        return False
+    t = re.sub(r"\s+", " ", target.lower().strip())
+    if t in WILDCARD_PHRASES:
+        return True
+    # "all <anything>" is also a wildcard — the noun is a category, not a row
+    if t.startswith("all "):
+        return True
+    if t.startswith("every "):
+        return True
+    if t.startswith("each "):
+        return True
+    return False
 
 
 def find_role_column(columns: List[Dict[str, Any]], role: str) -> Optional[str]:
@@ -67,19 +95,15 @@ def find_column_by_label(columns: List[Dict[str, Any]], needle: str) -> Optional
     if not needle:
         return None
     n = needle.lower().strip()
-    # exact key
     for c in columns:
         if n == c.get("key", "").lower():
             return c["key"]
-    # exact label
     for c in columns:
         if n == (c.get("label") or "").lower():
             return c["key"]
-    # substring
     for c in columns:
         if n in (c.get("label") or "").lower():
             return c["key"]
-    # token overlap
     n_words = [w for w in re.split(r"\s+", n) if w]
     best, best_score = None, 0
     for c in columns:
@@ -92,7 +116,6 @@ def find_column_by_label(columns: List[Dict[str, Any]], needle: str) -> Optional
 
 def ensure_column(columns: List[Dict[str, Any]], role: str,
                   label: str) -> Tuple[str, List[Dict[str, Any]]]:
-    """Ensure a column with the given role exists. Return (key, new_columns)."""
     key = find_role_column(columns, role)
     if key:
         return key, list(columns)
@@ -153,9 +176,12 @@ def match_rows_by_target(items: List[Dict[str, Any]],
                          columns: List[Dict[str, Any]],
                          target: str) -> List[int]:
     """
-    Return the indices of rows whose any-text-column contains every keyword
-    of `target` (or at least one if only one keyword).
+    Return indices of rows whose any-text-column contains all keywords of target
+    (or at least one if only one keyword). Wildcards match every row.
     """
+    if is_wildcard(target):
+        return list(range(len(items)))
+
     words = normalize_keywords(target)
     if not words:
         return []
@@ -171,7 +197,6 @@ def match_rows_by_target(items: List[Dict[str, Any]],
             for w in words:
                 if w in vl:
                     matched_words.add(w)
-        # require all words if multiple, else at least one
         if len(words) == 1 and matched_words:
             hits.append(idx)
         elif len(matched_words) == len(words):
@@ -180,20 +205,62 @@ def match_rows_by_target(items: List[Dict[str, Any]],
 
 
 # ===========================================================================
+#  COMPOUND COMMAND SPLITTER
+# ===========================================================================
+def split_compound(msg: str) -> List[str]:
+    """
+    Split a message into individual commands.
+    Preserves order. Only splits on separators that clearly separate two
+    imperatives.
+
+    Examples:
+      "add price 0.5 and calculate totals"           -> ["add price 0.5", "calculate totals"]
+      "remove column color then sort by variety"     -> ["remove column color", "sort by variety"]
+      "to all carnations add 0.5; recalculate totals"-> ["to all carnations add 0.5", "recalculate totals"]
+    """
+    if not msg or len(msg) < 4:
+        return [msg] if msg else []
+
+    # First, split on strong separators: ";", " then ", " & "
+    parts = re.split(r"\s*(?:;\s*|\s+then\s+|\s+&\s+)\s*", msg, flags=re.I)
+    parts = [p.strip() for p in parts if p.strip()]
+
+    # Then split each on " and " but ONLY when the piece after " and " looks
+    # like a new command (contains a known imperative verb).
+    final = []
+    command_verbs = r"\b(?:add|set|apply|remove|delete|drop|multiply|"
+    command_verbs += r"calculate|compute|recalc|update|clear|round|sort|"
+    command_verbs += r"increase|raise|discount|rename|make|give|assign|"
+    command_verbs += r"show|how|count|sum|total)\b"
+
+    for p in parts:
+        # Try to split on " and "
+        pieces = re.split(r"\s+and\s+", p, flags=re.I)
+        if len(pieces) <= 1:
+            final.append(p)
+            continue
+        # Merge pieces that don't start with a command verb into the previous one
+        merged = [pieces[0]]
+        for piece in pieces[1:]:
+            if re.search(command_verbs, piece, re.I):
+                merged.append(piece)
+            else:
+                merged[-1] = merged[-1] + " and " + piece
+        final.extend(merged)
+
+    return [f.strip() for f in final if f.strip()]
+
+
+# ===========================================================================
 #  TIER 1 HANDLERS
 #  Each returns (items, columns, explanation) or None.
 # ===========================================================================
 
-# ============================ SET UNIT PRICE ============================
 PRICE_RE = r"\$?\s*(\d+(?:[.,]\d+)?)"
 
 
+# ============================ SET UNIT PRICE ============================
 def handle_set_price(items, columns, msg):
-    """
-    Broadly recognizes price-assignment instructions. Handles word order
-    permutations, colons, "as/of/at/to", "$", "USD", etc.
-    """
-    # Normalize common punctuation but keep the $ for price detection
     m_text = re.sub(r"\busd\b", " ", msg, flags=re.I)
     m_text = re.sub(r"\bkes\b", " ", m_text, flags=re.I)
 
@@ -251,7 +318,6 @@ def handle_set_price(items, columns, msg):
         gd = m.groupdict()
         if "t" in gd and gd["t"]:
             target = gd["t"].strip()
-        # find price: last group that looks numeric
         for g in m.groups():
             if g is None or g == target:
                 continue
@@ -266,10 +332,9 @@ def handle_set_price(items, columns, msg):
 
     if price is None or not target:
         return None
-    if target.lower().strip() in STOPWORDS:
+    if target.lower().strip() in STOPWORDS and not is_wildcard(target):
         return None
 
-    # Ensure the unit_price column exists
     price_key, columns = ensure_column(columns, "unit_price", "Unit Price")
 
     hits = match_rows_by_target(items, columns, target)
@@ -284,32 +349,28 @@ def handle_set_price(items, columns, msg):
             r[price_key] = price
         updated.append(r)
 
+    label = "all rows" if is_wildcard(target) else f"“{target}”"
     return (updated, columns,
-            f"Set unit price to {price} on {len(hits)} row(s) matching “{target}”.")
+            f"Set unit price to {price} on {len(hits)} row(s) matching {label}.")
 
 
 # ============================ CALCULATE TOTALS ============================
 def handle_calculate_totals(items, columns, msg):
-    """
-    calculate totals | compute line totals | recalculate | update totals
-    """
     low = msg.lower()
-    if not (re.search(r"\b(calc(?:ulate)?|compute|recalc(?:ulate)?|update|refresh|fill)\b",
-                      low)
-            and re.search(r"\b(total|totals|line\s*total|amount|subtotal)\b", low)):
+    # Require a "totals"-ish word AND a "do it" word, OR just the bare word "totals"
+    has_total = re.search(r"\b(total|totals|line\s*total|line\s*totals|amount|amounts)\b",
+                          low)
+    has_verb = re.search(r"\b(calc(?:ulate)?|compute|recalc(?:ulate)?|"
+                         r"update|refresh|fill|add|make|create)\b", low)
+    if not has_total:
         return None
-    # Also match "add a line total column"
-    if not re.search(r"\b(total|totals|line\s*total|amount)\b", low):
-        return None
+    if not has_verb and "calculate" not in low and "compute" not in low:
+        # Allow bare "totals" or "line total" as an implicit command
+        if low.strip() not in ("totals", "line total", "total"):
+            return None
 
     qty_key = find_role_column(columns, "quantity")
     price_key = find_role_column(columns, "unit_price")
-    if not qty_key:
-        # maybe boxes × pack_rate?
-        box_key = find_role_column(columns, "boxes")
-        pack_key = find_role_column(columns, "pack_rate")
-        if box_key and pack_key:
-            qty_key = box_key  # fallback
     if not qty_key or not price_key:
         return None
 
@@ -321,8 +382,7 @@ def handle_calculate_totals(items, columns, msg):
         r = dict(row)
         r[total_key] = round(q * u, 2)
         updated.append(r)
-    return (updated, columns,
-            f"Calculated line total for {len(updated)} row(s).")
+    return (updated, columns, f"Calculated line total for {len(updated)} row(s).")
 
 
 # ============================ REMOVE COLUMN ============================
@@ -341,7 +401,6 @@ def handle_remove_column(items, columns, msg):
     key = find_column_by_label(columns, needle)
     if not key:
         return None
-
     new_cols = [c for c in columns if c["key"] != key]
     updated = [{k: v for k, v in row.items() if k != key} for row in items]
     label = next((c["label"] for c in columns if c["key"] == key), needle)
@@ -360,7 +419,6 @@ def handle_remove_rows(items, columns, msg):
     qty_key = find_role_column(columns, "quantity")
     price_key = find_role_column(columns, "unit_price")
 
-    # empty rows
     if re.search(r"\bempty\b|\bblank\b|\bno\s+content\b", low):
         kept, removed = [], 0
         for row in items:
@@ -370,7 +428,6 @@ def handle_remove_rows(items, columns, msg):
             kept.append(row)
         return (kept, columns, f"Removed {removed} empty row(s).")
 
-    # rows with zero quantity
     m = re.search(r"\b(?:zero|0|no)\b.*\b(?:quantity|qty|stems?)\b", low)
     m2 = re.search(r"\b(?:quantity|qty|stems?)\b.*\b(?:is|equals?|=)\s*(?:zero|0)\b", low)
     if m or m2:
@@ -383,10 +440,8 @@ def handle_remove_rows(items, columns, msg):
                 removed += 1
                 continue
             kept.append(row)
-        return (kept, columns,
-                f"Removed {removed} row(s) with zero quantity.")
+        return (kept, columns, f"Removed {removed} row(s) with zero quantity.")
 
-    # rows without price
     if re.search(r"\b(no|missing|empty|without)\s+price\b", low):
         if not price_key:
             return None
@@ -398,14 +453,12 @@ def handle_remove_rows(items, columns, msg):
             kept.append(row)
         return (kept, columns, f"Removed {removed} row(s) without a price.")
 
-    # rows where <column> = <value>
     m = re.search(
         r"\b(?:where|with|that\s+have|having|containing|matching)\s+"
         r"([a-z0-9 _\-]+?)\s*(?:=|is|equals?|contains?|includes?)?\s*"
         r"([a-z0-9 _\-]+?)(?:\s*$|[,.;!?])",
         low)
     if m:
-        # try to find which text column matches
         needle = f"{m.group(1)} {m.group(2)}"
         hits = set(match_rows_by_target(items, columns, needle))
         if hits:
@@ -424,7 +477,6 @@ def handle_multiply(items, columns, msg):
         r"\s+by\s+" + PRICE_RE,
         msg, re.I)
     if not m:
-        # also match "x3 on quantity" style
         m = re.search(
             r"\b(?:times|x)\s*" + PRICE_RE +
             r"\s+(?:on|for|to)\s+(quantit(?:y|ies)|qty|stems?|prices?|unit\s*price)",
@@ -475,7 +527,6 @@ def handle_discount(items, columns, msg):
     pct = float(m.group(1))
     factor = 1.0 - (pct / 100.0)
 
-    # Allow optional filter: "10% discount on all roses"
     m_filter = re.search(r"\b(?:on|for|to)\s+(?:all\s+|the\s+)?"
                          r"([a-z0-9 _\-']+?)(?:\s*$|[,.;!?])", msg, re.I)
     target_rows = None
@@ -506,7 +557,8 @@ def handle_discount(items, columns, msg):
         return None
     suffix = ""
     if m_filter:
-        suffix = f" on “{m_filter.group(1).strip()}”"
+        t = m_filter.group(1).strip()
+        suffix = " on all rows" if is_wildcard(t) else f" on “{t}”"
     return (updated, columns, f"Applied a {pct}% discount{suffix}.")
 
 
@@ -650,10 +702,6 @@ def handle_round(items, columns, msg):
 
 # ============================ SET COLUMN VALUE ============================
 def handle_set_column_value(items, columns, msg):
-    """
-    set <column> to <value>
-    set the <column> of all <target> to <value>
-    """
     m = re.search(
         r"\bset\s+(?:the\s+)?([a-z0-9 _\-]+?)\s+"
         r"(?:to|as|=)\s+([a-z0-9.$_\-]+)"
@@ -666,14 +714,10 @@ def handle_set_column_value(items, columns, msg):
     value_raw = m.group(2).strip()
     filter_target = (m.group(3) or "").strip()
 
-    # Skip if column needle is "unit price" — handled by set_price
-    if "price" in col_needle.lower() and col_needle.lower() != "unit price":
-        pass
     key = find_column_by_label(columns, col_needle)
     if not key:
         return None
 
-    # Parse value: number if numeric, else string
     v_num = to_num(value_raw)
     value = v_num if v_num is not None else value_raw
 
@@ -696,7 +740,9 @@ def handle_set_column_value(items, columns, msg):
     if applied == 0:
         return None
     label = next((c["label"] for c in columns if c["key"] == key), col_needle)
-    suffix = f" on “{filter_target}”" if filter_target else ""
+    suffix = ""
+    if filter_target:
+        suffix = " on all rows" if is_wildcard(filter_target) else f" on “{filter_target}”"
     return (updated, columns,
             f"Set {label} to {value}{suffix} on {applied} row(s).")
 
@@ -730,22 +776,20 @@ def handle_question(items, columns, msg):
     price_key = find_role_column(columns, "unit_price")
     total_key = find_role_column(columns, "total")
 
-    # count rows
     if re.search(r"\b(how\s+many\s+rows?|row\s+count|count\s+(?:of\s+)?rows?|"
                  r"number\s+of\s+rows?|how\s+many\s+(?:items?|entries|lines?))\b", low):
         return (items, columns, f"There are {len(items)} rows.")
 
-    # total quantity
     if (re.search(r"\b(total|sum|overall|how\s+many)\b", low)
         and re.search(r"\b(quantity|qty|stems?|units?|pieces?)\b", low)
-        and not re.search(r"\b(add|set|calc|remove|delete|discount|multiply)\b", low)):
+        and not re.search(r"\b(add|set|calc|remove|delete|discount|multiply|"
+                          r"calculate|compute)\b", low)):
         if qty_key:
             total = sum(to_num(r.get(qty_key)) or 0 for r in items)
             return (items, columns,
                     f"Total quantity is {int(total) if float(total).is_integer() else round(total, 2)}.")
         return None
 
-    # total amount
     if (re.search(r"\b(total|sum|grand|overall)\s+(?:of\s+)?"
                   r"(amount|price|value|cost|invoice)\b", low)
         or re.search(r"\bhow\s+much\b.*\btotal\b", low)):
@@ -758,7 +802,6 @@ def handle_question(items, columns, msg):
             return None
         return (items, columns, f"Total amount is {round(total, 2)}.")
 
-    # how many <target>
     m = re.search(r"\bhow\s+many\s+([a-z0-9 _\-']+?)(?:\s*\?|\s*$|,|\.|!)", low)
     if m:
         target = m.group(1).strip()
@@ -766,14 +809,12 @@ def handle_question(items, columns, msg):
         return (items, columns,
                 f"I found {len(hits)} row(s) matching “{target}”.")
 
-    # count <target>
     m = re.search(r"\bcount\s+(?:of\s+)?([a-z0-9 _\-']+?)(?:\s*$|[,.;!?])", low)
     if m:
         target = m.group(1).strip()
         hits = match_rows_by_target(items, columns, target)
         return (items, columns, f"{len(hits)} row(s) match “{target}”.")
 
-    # sum of <column>
     m = re.search(r"\b(?:sum|total)\s+of\s+([a-z0-9 _\-]+)", low)
     if m:
         key = find_column_by_label(columns, m.group(1))
@@ -787,7 +828,6 @@ def handle_question(items, columns, msg):
 
 # ============================ DISPATCHER ============================
 DETERMINISTIC_HANDLERS = [
-    # Order matters — most specific first
     handle_set_price,
     handle_calculate_totals,
     handle_remove_column,
@@ -837,7 +877,7 @@ Return ONLY valid JSON with this exact shape:
 }
 
 Action arguments:
-  set_price:        {"filter": "<substring>", "price": <number>}
+  set_price:        {"filter": "<substring>" | null (for all rows), "price": <number>}
   calculate_totals: {}
   multiply:         {"target": "quantity"|"unit_price"|"total", "factor": <number>}
   add_fixed:        {"target": "unit_price"|"total", "delta": <number>}
@@ -851,7 +891,8 @@ Action arguments:
   rename_column:    {"from": "<label>", "to": "<new label>"}
   none:             {}
 
-Do not invent prices or quantities. When unsure, use "none".
+When the user says "all" or "every" without a specific category, use filter: null
+to mean every row. Never invent prices or quantities. When unsure, use "none".
 """
 
 
@@ -870,7 +911,6 @@ def _ai_clean_json(text: str) -> Optional[dict]:
 
 
 def _ai_call(prompt: str) -> Optional[str]:
-    """Ask whichever provider is up. Never raises."""
     if AI_PROVIDER in ("gemini", "auto"):
         try:
             import google.generativeai as genai
@@ -912,14 +952,12 @@ def _ai_call(prompt: str) -> Optional[str]:
                     return resp.choices[0].message.content
         except Exception as e:
             logger.warning(f"Groq chat call failed: {e}")
-
     return None
 
 
 def run_ai(items, columns, message):
     if not AI_ENABLED:
         return None
-
     payload = json.dumps({
         "columns": columns,
         "items": items[:200],
@@ -937,11 +975,12 @@ def run_ai(items, columns, message):
 
     try:
         if action == "set_price":
-            filter_ = str(args.get("filter", "")).strip()
+            filter_ = args.get("filter")
             price = float(args.get("price"))
-            if not filter_:
-                return None
-            return _apply_set_price(items, columns, filter_, price, explanation)
+            if filter_ is None:
+                filter_ = ""     # empty = wildcard = all rows
+            filter_str = str(filter_).strip()
+            return _apply_set_price(items, columns, filter_str, price, explanation)
 
         if action == "calculate_totals":
             return _apply_calc_totals(items, columns, explanation)
@@ -1107,16 +1146,18 @@ def run_ai(items, columns, message):
     except Exception as e:
         logger.warning(f"AI action execution failed: {e}")
         return None
-
     return None
 
 
 def _apply_set_price(items, columns, filter_, price, explanation):
     price_key, columns = ensure_column(columns, "unit_price", "Unit Price")
-    hits = match_rows_by_target(items, columns, filter_)
-    if not hits:
-        return None
-    hit_set = set(hits)
+    if not filter_ or is_wildcard(filter_):
+        hit_set = set(range(len(items)))
+    else:
+        hits = match_rows_by_target(items, columns, filter_)
+        if not hits:
+            return None
+        hit_set = set(hits)
     updated = []
     for idx, row in enumerate(items):
         r = dict(row)
@@ -1124,7 +1165,7 @@ def _apply_set_price(items, columns, filter_, price, explanation):
             r[price_key] = price
         updated.append(r)
     return (updated, columns,
-            explanation or f"Set unit price to {price} on {len(hits)} row(s).")
+            explanation or f"Set unit price to {price} on {len(hit_set)} row(s).")
 
 
 def _apply_calc_totals(items, columns, explanation):
@@ -1144,7 +1185,7 @@ def _apply_calc_totals(items, columns, explanation):
 
 
 # ===========================================================================
-#  PUBLIC ENTRY POINT
+#  PUBLIC ENTRY POINT — supports compound commands
 # ===========================================================================
 FRIENDLY_FALLBACK = (
     "I didn't quite understand that instruction. Try things like "
@@ -1157,7 +1198,10 @@ FRIENDLY_FALLBACK = (
 def process_message(items: List[Dict[str, Any]],
                     columns: List[Dict[str, Any]],
                     message: str) -> Dict[str, Any]:
-    """Run Tier 1, then Tier 2. Always returns a well-formed response."""
+    """
+    Split compound messages, run each part through Tier 1 then Tier 2,
+    and return the final state plus a combined explanation.
+    """
     msg = (message or "").strip()
     if not msg:
         return {
@@ -1166,42 +1210,67 @@ def process_message(items: List[Dict[str, Any]],
             "applied_via": "none",
         }
 
-    # Tier 1 — deterministic
-    result = run_deterministic(items, columns, msg)
-    if result:
+    # Split into one or more commands
+    commands = split_compound(msg)
+
+    current_items = items
+    current_columns = columns
+    explanations: List[str] = []
+    applied_tiers: List[str] = []
+
+    for cmd in commands:
+        # Tier 1
+        result = run_deterministic(current_items, current_columns, cmd)
+        tier = "deterministic"
+        if not result:
+            # Tier 2
+            result = run_ai(current_items, current_columns, cmd)
+            tier = "ai"
+        if not result:
+            # Neither matched this command
+            explanations.append(f"Could not process: “{cmd}”.")
+            applied_tiers.append("unrecognized")
+            continue
+
         new_items, new_cols, explanation = result
-        # Never surface technical text to users
+        # Sanitize
         if not explanation or re.search(
                 r"\b(module|import|engine|server|traceback|exception)\b",
                 explanation, re.I):
             explanation = "Done."
+        current_items = new_items
+        current_columns = new_cols
+        explanations.append(explanation)
+        applied_tiers.append(tier)
+
+    # If NO command was recognized at all
+    if not explanations or all(t == "unrecognized" for t in applied_tiers):
         return {
             "success": True,
-            "items": new_items,
-            "columns": new_cols,
-            "explanation": explanation,
-            "applied_via": "deterministic",
+            "items": items,
+            "columns": columns,
+            "explanation": FRIENDLY_FALLBACK,
+            "applied_via": "unrecognized",
         }
 
-    # Tier 2 — AI helper
-    result = run_ai(items, columns, msg)
-    if result:
-        new_items, new_cols, explanation = result
-        if not explanation:
-            explanation = "Done."
-        return {
-            "success": True,
-            "items": new_items,
-            "columns": new_cols,
-            "explanation": explanation,
-            "applied_via": "ai",
-        }
+    # Combine — if multiple commands, number them
+    if len(explanations) == 1:
+        combined = explanations[0]
+    else:
+        combined = "\n".join(f"{i+1}. {e}" for i, e in enumerate(explanations))
 
-    # Neither worked — friendly prompt, never technical
+    # Overall applied_via
+    if all(t == "deterministic" for t in applied_tiers):
+        via = "deterministic"
+    elif all(t == "ai" for t in applied_tiers):
+        via = "ai"
+    else:
+        via = "mixed"
+
     return {
         "success": True,
-        "items": items,
-        "columns": columns,
-        "explanation": FRIENDLY_FALLBACK,
-        "applied_via": "unrecognized",
+        "items": current_items,
+        "columns": current_columns,
+        "explanation": combined,
+        "applied_via": via,
     }
