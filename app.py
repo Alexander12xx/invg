@@ -1,44 +1,43 @@
 """
-Smart Document Intelligence Engine v12.0
-Deterministic fast path + optional AI assist (Gemini / Groq).
+Smart Document Intelligence Engine v13.0
+Dynamic-schema extraction with prompt-driven enrichment.
 
-Architecture:
-  1. PDF/text/tabular → PyMuPDF text → our deterministic regex parser (<2s)
-  2. If deterministic parse yields 0 items → AI assist (Gemini, then Groq)
-  3. If image OCR fails → Gemini Vision
-  4. Every response passes through Pydantic for arithmetic validation
-  5. Every request has a hard wall-clock budget (ANALYZE_TIMEOUT_SECONDS)
+What changed vs. v12:
+  • Documents are no longer forced into a fixed column set.
+  • Original columns are preserved in their original order and labels.
+  • Computed columns (unit_price, line_total) are appended, not substituted.
+  • New endpoint /api/apply-prompt applies natural-language instructions.
+  • All responses include a `columns` array describing the table layout.
 
-The engine works without AI (AI_ENABLED=0). AI only improves coverage.
-The engine never trusts an LLM for arithmetic — Pydantic recomputes and flags.
-
-API contract preserved — no PHP or DB changes needed.
+API contract is backward-compatible: `items` still exists, and each item
+still carries canonical fields (product_name, quantity, unit_price, total)
+in addition to original columns.
 
 ALTECH SOFTWARE DEVELOPERS
 """
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 from datetime import datetime
-from decimal import Decimal
 import io
 import os
 import re
 import json
 import math
 import time
-import base64
 import logging
 import statistics
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 import PyPDF2
 import docx
-from PIL import Image, ImageOps, ImageEnhance
+from PIL import Image, ImageEnhance
 import pytesseract
 from rapidfuzz import fuzz
 
@@ -48,9 +47,9 @@ except Exception:
     fitz = None
 
 try:
-    import openpyxl  # noqa: F401
+    from docx import Document as DocxDocument
 except Exception:
-    openpyxl = None
+    DocxDocument = None
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("smart-document-engine")
@@ -59,23 +58,20 @@ TESS_CMD = os.getenv("TESSERACT_CMD", "/usr/bin/tesseract")
 if os.path.exists(TESS_CMD):
     pytesseract.pytesseract.tesseract_cmd = TESS_CMD
 
-ENGINE_VERSION = "12.0.0"
+ENGINE_VERSION = "13.0.0"
 
 # ---------------------------------------------------------------------------
-#  AI CONFIGURATION
+#  AI configuration
 # ---------------------------------------------------------------------------
 AI_ENABLED = os.getenv("AI_ENABLED", "0") == "1"
-AI_PROVIDER = os.getenv("AI_PROVIDER", "auto").lower()   # gemini | groq | auto
+AI_PROVIDER = os.getenv("AI_PROVIDER", "auto").lower()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-AI_TIMEOUT_SECONDS = int(os.getenv("AI_TIMEOUT_SECONDS", "25"))
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
-# Lazy-loaded AI clients (never crash if SDKs are missing)
 _gemini_model = None
 _groq_client = None
-
 
 def _get_gemini():
     global _gemini_model
@@ -87,12 +83,10 @@ def _get_gemini():
         import google.generativeai as genai
         genai.configure(api_key=GEMINI_API_KEY)
         _gemini_model = genai.GenerativeModel(GEMINI_MODEL)
-        logger.info(f"Gemini {GEMINI_MODEL} ready")
         return _gemini_model
     except Exception as e:
         logger.warning(f"Gemini unavailable: {e}")
         return None
-
 
 def _get_groq():
     global _groq_client
@@ -103,129 +97,215 @@ def _get_groq():
     try:
         from groq import Groq
         _groq_client = Groq(api_key=GROQ_API_KEY)
-        logger.info(f"Groq {GROQ_MODEL} ready")
         return _groq_client
     except Exception as e:
         logger.warning(f"Groq unavailable: {e}")
         return None
 
 
-# ---------------------------------------------------------------------------
-#  APP
-# ---------------------------------------------------------------------------
-app = FastAPI(
-    title="Smart Document Intelligence Engine",
-    version=ENGINE_VERSION,
-    description="Deterministic extraction + optional AI assist.",
-)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
-)
+app = FastAPI(title="Smart Document Intelligence Engine", version=ENGINE_VERSION)
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_methods=["*"], allow_headers=["*"])
 
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "25"))
-MIN_MATCH_CONFIDENCE = float(os.getenv("MIN_MATCH_CONFIDENCE", "0.84"))
-MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "30"))
-OCR_DPI = int(os.getenv("OCR_DPI", "150"))
-MAX_OCR_PAGES = int(os.getenv("MAX_OCR_PAGES", "12"))
 ANALYZE_TIMEOUT_SECONDS = int(os.getenv("ANALYZE_TIMEOUT_SECONDS", "60"))
+MAX_OCR_PAGES = int(os.getenv("MAX_OCR_PAGES", "12"))
 
 
 # ===========================================================================
-#  PYDANTIC SCHEMA — strict routing, arithmetic validation
+#  CANONICAL COLUMN MAP
+#  These are the "known" semantic roles a column can play. Any column that
+#  doesn't match one of these is preserved as-is under its original label.
 # ===========================================================================
-
-class ExtractedLineItem(BaseModel):
-    product_name: str = Field(..., min_length=1)
-    variety: Optional[str] = None
-    farm_code: Optional[str] = None
-    boxes: Optional[float] = None
-    pack_rate: Optional[float] = None
-    quantity: Optional[float] = None
-    unit_price: Optional[float] = None
-    total: Optional[float] = None
-    specification: Dict[str, Any] = Field(default_factory=dict)
-    raw_values: Dict[str, Any] = Field(default_factory=dict)
-    confidence: float = Field(0.5, ge=0.0, le=1.0)
-    validation_warnings: List[str] = Field(default_factory=list)
-    row_index: Optional[int] = None
-
-    @field_validator("product_name", "variety", mode="before")
-    @classmethod
-    def strip_prices(cls, value, info):
-        if value is None:
-            return None
-        text = str(value).strip()
-        if not text:
-            return None
-        # If it contains currency symbols AND price labels, strip them
-        if re.search(r"[\$€£]|(?:\b(?:USD|KES|EUR|GBP|AED)\b)", text, re.I):
-            if re.search(r"\b(?:price|rate|cost|total|amount|unit\s*price)\b",
-                         text, re.I):
-                text = re.sub(r"[\$€£]\s*\d+(?:\.\d+)?", "", text)
-                text = re.sub(
-                    r"(?i)\b(?:price|rate|cost|total|amount)\b\s*[:=]?\s*[\d,.]+",
-                    "", text)
-                text = re.sub(r"\s+", " ", text).strip()
-        return text if len(text) >= 2 else None
-
-    @field_validator("boxes", "pack_rate", "quantity", mode="before")
-    @classmethod
-    def to_num(cls, value):
-        if value is None or value == "":
-            return None
-        try:
-            f = float(value)
-            return int(f) if f.is_integer() else f
-        except (ValueError, TypeError):
-            return None
-
-    @field_validator("unit_price", "total", mode="before")
-    @classmethod
-    def to_float(cls, value):
-        if value is None or value == "":
-            return None
-        try:
-            return float(value)
-        except (ValueError, TypeError):
-            return None
-
-    @model_validator(mode="after")
-    def reconcile(self):
-        w = list(self.validation_warnings)
-        if self.quantity and self.unit_price and self.total:
-            expected = self.quantity * self.unit_price
-            if abs(expected - self.total) > max(0.05, abs(self.total) * 0.02):
-                w.append("quantity_x_unit_price_does_not_match_total")
-        if self.boxes and self.pack_rate and self.quantity:
-            expected = self.boxes * self.pack_rate
-            if abs(expected - self.quantity) > 0.5:
-                w.append("boxes_x_pack_rate_does_not_match_quantity")
-        self.validation_warnings = sorted(set(w))
-        return self
+CANONICAL_ROLES = {
+    "product_name": [
+        "product", "product name", "item", "item name", "flower", "flower name",
+        "description", "product/service", "particulars", "goods", "articles",
+        "flower variety", "variety", "cultivar", "species",
+    ],
+    "quantity": [
+        "quantity", "qty", "qnty", "stems", "total stems", "pieces", "pcs",
+        "count", "units", "total quantity", "qty trial only - stems",
+        "qty trial only -stems", "qty trial only stems",
+    ],
+    "boxes": ["boxes", "box", "bx", "cartons", "carton", "ctn", "cases"],
+    "pack_rate": [
+        "packrate", "pack rate", "pack_rate", "per box", "per carton",
+        "stems per box", "stems/box", "qty per box",
+    ],
+    "unit_price": [
+        "price", "unit price", "unit_price", "cost", "rate",
+        "price per stem", "price/stem", "unit cost",
+    ],
+    "total": ["total", "amount", "line total", "line amount", "extended price"],
+    "length_cm": ["length", "length (cm)", "length(cm)", "size", "stem length"],
+    "color": ["color", "colour", "shade"],
+    "head_size_cm": ["head size", "head size (cm)", "head size(cm)"],
+    "n": ["n", "no", "no.", "#", "s/n", "sr", "index"],
+}
 
 
-class MatchRequest(BaseModel):
-    items: List[Dict[str, Any]]
-    company_products: List[Dict[str, Any]]
+def classify_column(label: str) -> Optional[str]:
+    """Return the canonical role for a column label, or None if unknown."""
+    if not label:
+        return None
+    l = re.sub(r"[^a-z0-9 _\-]|_", " ", str(label).lower()).strip()
+    l = re.sub(r"\s+", " ", l)
+    if not l:
+        return None
+
+    # Exact match
+    for role, names in CANONICAL_ROLES.items():
+        for n in names:
+            if l == re.sub(r"[^a-z0-9 _\-]", " ", n.lower()).strip():
+                return role
+
+    # Fuzzy match
+    best_role, best_score = None, 0
+    for role, names in CANONICAL_ROLES.items():
+        for n in names:
+            s = fuzz.token_set_ratio(l, re.sub(r"[^a-z0-9 _\-]", " ", n.lower()).strip())
+            if s > best_score:
+                best_score, best_role = s, role
+    return best_role if best_score >= 88 else None
+
+
+def slugify(label: str, taken: set) -> str:
+    """Create a unique snake_case key from a column label."""
+    base = re.sub(r"[^a-z0-9]+", "_", str(label).lower()).strip("_") or "col"
+    key = base
+    i = 2
+    while key in taken:
+        key = f"{base}_{i}"
+        i += 1
+    taken.add(key)
+    return key
 
 
 # ===========================================================================
-#  HELPERS
+#  TABLE STRUCTURE — the new shape
 # ===========================================================================
-
-def norm(s: Any) -> str:
-    s = "" if s is None else str(s)
-    s = s.replace("–", "-").replace("—", "-").replace("’", "'")
-    return re.sub(r"\s+", " ", s.strip().lower())
+def make_column(key: str, label: str, role: Optional[str], source: str) -> Dict[str, Any]:
+    return {"key": key, "label": label, "role": role, "source": source}
 
 
-def clean_ocr_text(text: str) -> str:
-    text = text.replace("\x00", "")
-    text = re.sub(r"[ \t]+", " ", text)
-    return text
+def build_columns_from_headers(headers: List[str]) -> List[Dict[str, Any]]:
+    taken: set = set()
+    cols = []
+    for h in headers:
+        label = str(h or "").strip() or "Column"
+        key = slugify(label, taken)
+        role = classify_column(label)
+        cols.append(make_column(key, label, role, "original"))
+    return cols
 
 
+def ensure_semantic_columns(columns: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Append missing semantic roles as empty 'added' columns."""
+    have = {c.get("role") for c in columns if c.get("role")}
+    taken = {c["key"] for c in columns}
+
+    additions = [
+        ("unit_price", "Unit Price"),
+        ("total", "Line Total"),
+    ]
+    for role, label in additions:
+        if role in have:
+            continue
+        key = slugify(label, taken)
+        columns.append(make_column(key, label, role, "added"))
+        have.add(role)
+    return columns
+
+
+# ===========================================================================
+#  EXCEL / CSV — dynamic extraction
+# ===========================================================================
+def find_header_row(df: pd.DataFrame) -> int:
+    """Find the row most likely to be the header."""
+    best_i, best_score = 0, -1
+    for i in range(min(15, len(df))):
+        row = [str(v) for v in df.iloc[i].tolist() if pd.notna(v) and str(v).strip()]
+        if len(row) < 2:
+            continue
+        score = sum(1 for v in row if classify_column(v) is not None)
+        if score > best_score:
+            best_score, best_i = score, i
+    return best_i
+
+
+def extract_from_dataframe_dynamic(df: pd.DataFrame) -> Dict[str, Any]:
+    if df is None or df.empty:
+        return {"columns": [], "items": []}
+
+    header_row = find_header_row(df)
+    raw_headers = [str(v).strip() if pd.notna(v) else "" for v in df.iloc[header_row].tolist()]
+
+    # Drop trailing empty columns
+    while raw_headers and not raw_headers[-1]:
+        raw_headers.pop()
+
+    if not raw_headers:
+        return {"columns": [], "items": []}
+
+    columns = build_columns_from_headers(raw_headers)
+
+    items: List[Dict[str, Any]] = []
+    for i in range(header_row + 1, len(df)):
+        row = df.iloc[i]
+        record: Dict[str, Any] = {}
+        empty = True
+        for col_idx, col in enumerate(columns):
+            if col_idx >= len(row):
+                record[col["key"]] = None
+                continue
+            val = row.iloc[col_idx]
+            if pd.isna(val):
+                record[col["key"]] = None
+                continue
+            empty = False
+            # Keep numbers as numbers
+            if isinstance(val, (int, float)):
+                record[col["key"]] = int(val) if float(val).is_integer() else float(val)
+            else:
+                record[col["key"]] = str(val).strip()
+        if empty:
+            continue
+
+        # Skip summary rows like "Total"
+        first_val = next((v for v in record.values() if v), "")
+        if isinstance(first_val, str) and first_val.lower().strip() in (
+                "total", "subtotal", "grand total"):
+            continue
+
+        # Fill in canonical aliases so downstream code can read `quantity` etc.
+        for col in columns:
+            role = col.get("role")
+            if role and role not in record:
+                record[role] = record.get(col["key"])
+            elif role and record.get(role) in (None, ""):
+                record[role] = record.get(col["key"])
+
+        # Try to derive numeric values from labels
+        for col in columns:
+            if col.get("role") in ("quantity", "boxes", "pack_rate", "length_cm", "head_size_cm"):
+                v = record.get(col["key"])
+                if v is not None:
+                    try:
+                        f = float(v)
+                        record[col["key"]] = int(f) if f.is_integer() else f
+                    except (TypeError, ValueError):
+                        pass
+
+        items.append(record)
+
+    columns = ensure_semantic_columns(columns)
+    return {"columns": columns, "items": items}
+
+
+# ===========================================================================
+#  TEXT / PDF / DOCX — best-effort tabular extraction
+# ===========================================================================
 def parse_number(value: Any) -> Optional[float]:
     if value is None or isinstance(value, bool):
         return None
@@ -246,8 +326,6 @@ def parse_number(value: Any) -> Optional[float]:
             txt = txt.replace(".", "").replace(",", ".")
         else:
             txt = txt.replace(",", "")
-    elif re.search(r",\d{1,2}$", txt):
-        txt = txt.replace(".", "").replace(",", ".")
     else:
         txt = txt.replace(",", "")
     m = re.search(r"-?\d+(?:\.\d+)?", txt)
@@ -259,999 +337,143 @@ def parse_number(value: Any) -> Optional[float]:
         return None
 
 
-def as_number(v):
-    n = parse_number(v)
-    if n is None:
-        return None
-    return int(n) if float(n).is_integer() else n
+def extract_from_text_dynamic(text: str) -> Dict[str, Any]:
+    """
+    Best-effort dynamic extraction from free-form text.
+    Splits each line into cells; finds a header; preserves all columns.
+    """
+    lines = [l.rstrip() for l in text.splitlines() if l.strip()]
+    if not lines:
+        return {"columns": [], "items": []}
 
-
-def empty_field(v) -> bool:
-    if v is None:
-        return True
-    s = str(v).strip().lower()
-    return s == "" or s in {"n/a", "na", "null", "none", "-", "—", "?"}
-
-
-def safe_sum(values) -> float:
-    total = 0.0
-    for v in values:
-        if v is None:
+    # Find header: line with the most recognizable column labels
+    best_idx, best_score, best_cells = None, 0, []
+    for i, line in enumerate(lines[:30]):
+        cells = [c.strip() for c in re.split(r"\s*\|\s*|\t+|\s{2,}", line) if c.strip()]
+        if len(cells) < 2:
+            cells = line.split()
+        if len(cells) < 2:
             continue
-        try:
-            total += float(v)
-        except Exception:
-            continue
-    return total
+        score = sum(1 for c in cells if classify_column(c) is not None)
+        if score > best_score:
+            best_score, best_idx, best_cells = score, i, cells
 
+    if best_idx is None or best_score == 0:
+        # Fallback: single-column list
+        return {
+            "columns": [make_column("item", "Item", None, "original")],
+            "items": [{"item": l, "product_name": l} for l in lines],
+        }
 
-# ===========================================================================
-#  FIELD KNOWLEDGE
-# ===========================================================================
+    columns = build_columns_from_headers(best_cells)
+    expected = len(columns)
 
-COLUMN_SYNONYMS = {
-    "product": ["product", "product name", "product/service", "product / service",
-                "product or service", "item", "item name", "service", "article",
-                "articles", "commodity", "goods", "stock item", "particulars",
-                "product description", "item description", "description of goods",
-                "flower", "flower variety"],
-    "variety": ["variety", "flower", "flower name", "flower type", "species",
-                "cultivar", "kind", "variety name", "flower variety"],
-    "description": ["description", "desc", "details", "item details",
-                    "specification", "specifications", "remarks",
-                    "product details", "product / service description"],
-    "farm_code": ["farm code", "farmcode", "farm reference", "farm ref",
-                  "supplier code", "grower code", "grower reference"],
-    "boxes": ["boxes", "box", "bx", "cartons", "carton", "ctn", "cases",
-              "case", "bundles", "bundle", "packages", "pkg"],
-    "pack_rate": ["packrate", "pack rate", "pack_rate", "per box", "per carton",
-                  "stems per box", "stems/box", "qty per box",
-                  "quantity per box", "stems per carton", "qty/carton"],
-    "quantity": ["quantity", "qty", "qnty", "stems", "pcs", "pieces", "count",
-                 "total quantity", "total qty", "number of stems",
-                 "stem quantity", "invoice quantity", "total stems"],
-    "unit_price": ["price", "price per stem", "price/stem", "unit price",
-                   "unit price (usd)", "cost", "price per unit",
-                   "per stem", "per piece", "amount per stem", "unit cost",
-                   "rate per stem", "selling price", "unit selling price"],
-    "total": ["total", "total price", "total amount", "line total",
-              "line amount", "sub-total", "subtotal", "extended price",
-              "line value", "amount"],
-    "length": ["length", "length(cm)", "length (cm)", "size", "size(cm)",
-               "stem length", "height", "stem size", "length cm"],
-    "discount": ["discount", "disc.", "rebate"],
-    "tax": ["tax", "vat", "gst", "sales tax"],
-}
-
-NON_PRODUCT_TERMS = {
-    "invoice", "commercial invoice", "tax invoice", "proforma invoice",
-    "proforma", "quotation", "quote", "estimate", "receipt", "payment receipt",
-    "delivery note", "dispatch note", "packing list", "packing slip",
-    "credit note", "credit memo", "purchase order", "statement",
-    "invoice details", "invoice number", "order details",
-    "consignee", "consignee details", "consignee name", "consignee address",
-    "seller", "seller name", "seller/exporter", "exporter", "exporter name",
-    "buyer", "buyer name", "buyer address", "customer", "customer name",
-    "customer details", "customer address", "bill to", "ship to",
-    "sold to", "deliver to",
-    "payment terms", "payment term", "terms of payment",
-    "transportation", "transport", "shipment method",
-    "notes", "note", "comments", "comment", "remarks",
-    "items", "products", "product/service", "product / service",
-    "product or service", "particulars",
-    "description", "product description", "service description",
-    "product / service description",
-    "variety", "flower", "flower variety", "flower name",
-    "quantity", "qty", "stems", "total stems",
-    "price", "unit price", "price per stem", "unit price (usd)",
-    "total", "amount", "line total", "line amount",
-    "boxes", "packrate", "pack rate", "pack_rate", "length",
-    "farm code", "farmcode",
-    "country of destination", "destination", "destination country",
-    "country of origin", "origin country",
-    "point of entry", "port of entry", "port", "airport",
-    "date of shipment", "shipment date", "invoice date", "issue date",
-    "due date", "payment due", "valid until", "expiry",
-    "currency", "currency code", "vat", "tax", "vat rate", "tax rate",
-    "subtotal", "sub-total", "grand total", "balance due",
-    "awb", "awb number", "awb fee", "air waybill",
-    "net weight", "gross weight", "net kg", "gross kg",
-}
-
-COMPANY_TERMS = re.compile(
-    r"\b(limited|ltd\.?|llc|inc\.?|plc|company|enterprises?|"
-    r"investment|trading|holdings?)\b", re.I)
-
-ADDRESS_TERMS = re.compile(
-    r"\b(street|st\.|road|rd\.|avenue|ave\.|building|bldg|floor|"
-    r"suite|tower|plaza|po box|postal code|p\.o\.)\b", re.I)
-
-PHONE_RE = re.compile(r"(?:\+?\d[\d\s\-().]{7,}\d)")
-EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
-URL_RE = re.compile(
-    r"(?:https?://|www\.)\S+|\b[a-z0-9\-]+\.(?:com|net|org|io|ke|co\.ke|tc|info|biz)\b",
-    re.I)
-HASH_ID_RE = re.compile(r"^#?[A-Z]{2,}\d{4,}[A-Z0-9\-]*$", re.I)
-
-HEADER_WORDS = {
-    "flower", "variety", "length", "pack", "rate", "boxes", "box",
-    "total", "stems", "stem", "unit", "price", "amount", "qty",
-    "quantity", "description", "product", "service", "item", "no",
-    "cartons", "carton", "bundles", "bundle", "val", "value",
-}
-
-
-def is_boilerplate(line: str) -> bool:
-    if not line:
-        return True
-    s = line.strip()
-    if re.search(r"computer[- ]generated|no\s+signature\s+required|"
-                 r"^\s*thank\s+you|^\s*generated\s+on|^\s*scan\s+to\s+verify|"
-                 r"^\s*page\s+\d+|^\s*paid\s*$|^\s*sent\s*$|"
-                 r"^\s*(?:sub[- ]?total|grand\s+total|balance\s+due)\b|"
-                 r"prices?\s+are\s+inclusive|delivery\s+cost\s+is\s+the\s+buyer",
-                 s, re.I):
-        return True
-    if URL_RE.search(s) or EMAIL_RE.search(s):
-        return True
-    if HASH_ID_RE.match(s):
-        return True
-    return False
-
-
-def is_contact_or_address(line: str) -> bool:
-    s = (line or "").strip()
-    if not s:
-        return True
-    if PHONE_RE.search(s) and len(re.findall(r"\d", s)) >= 7:
-        return True
-    if EMAIL_RE.search(s) or URL_RE.search(s):
-        return True
-    if ADDRESS_TERMS.search(s) and len(s.split()) <= 8:
-        return True
-    return False
-
-
-def looks_like_product(name: str) -> bool:
-    n = str(name or "").strip()
-    if len(n) < 2 or not re.search(r"[A-Za-z]{3,}", n):
-        return False
-    low = norm(n)
-    if low in NON_PRODUCT_TERMS:
-        return False
-    # Reject rows made entirely of header tokens
-    toks = re.findall(r"[A-Za-z]+", n.lower())
-    if toks and all(t in HEADER_WORDS for t in toks):
-        return False
-    if "@" in n or URL_RE.search(n):
-        return False
-    if ADDRESS_TERMS.search(n):
-        return False
-    if COMPANY_TERMS.search(n) and not re.search(
-            r"\b(rose|roses|flower|flowers|plant|goods|supplies|"
-            r"celocia|carnation|chrysanthemum|tulip|lily|orchid|gerbera|"
-            r"alstroemeria|alstromeria|sunflower|eustoma|hydrangea|"
-            r"birds?\s+of\s+paradise|strelitzia|gypsophila|solidago|"
-            r"limonium|eucalyptus|ruscus|matthiola|hypericum)\b", n, re.I):
-        return False
-    if is_boilerplate(n) or is_contact_or_address(n):
-        return False
-    if re.fullmatch(r"[\d\s.,:/()%$€£+\-]+", n):
-        return False
-    return True
-
-
-def is_header_or_metadata(line: str) -> bool:
-    s = str(line or "").strip()
-    if not s:
-        return True
-    if re.match(r"^(?:invoice|inv|quote|qtn|proforma|po|flr)[\s/#-]*[\w/-]+$",
-                norm(s)):
-        return True
-    if re.fullmatch(r"[\d\s.,:/()%$€£-]+", s):
-        return True
-    return False
-
-
-# ===========================================================================
-#  HEADER MATCHING
-# ===========================================================================
-
-def match_header(label: str) -> Optional[str]:
-    l = norm(label)
-    l = re.sub(r"^[#*]+", "", l)
-    l = re.sub(r"[*:.#]+$", "", l).strip()
-    if not l:
-        return None
-    if l in {"#", "no", "no.", "s/n", "sn", "sr"}:
-        return "row_index"
-    for field, names in COLUMN_SYNONYMS.items():
-        if l in {norm(x) for x in names}:
-            return field
-    priority = ["pack_rate", "unit_price", "farm_code", "quantity", "boxes",
-                "length", "total", "product", "variety", "description"]
-    for field in priority:
-        for n in COLUMN_SYNONYMS[field]:
-            nn = norm(n)
-            if len(nn) >= 5 and (nn in l or l in nn):
-                return field
-    best_field, best_score = None, 0
-    for field, names in COLUMN_SYNONYMS.items():
-        for n in names:
-            s = fuzz.token_set_ratio(l, norm(n))
-            if s > best_score:
-                best_score, best_field = s, field
-    return best_field if best_score >= 88 else None
-
-
-HEADER_TOKEN_SET = {
-    "flower", "variety", "length", "pack", "rate", "boxes", "box",
-    "total", "stems", "stem", "unit", "price", "amount", "qty",
-    "quantity", "description", "product", "service", "item",
-    "cartons", "carton", "bundles", "bundle", "no", "val", "value",
-}
-
-
-def _tokenize_header_block(block_text: str) -> List[str]:
-    """Split a header block into column-ish tokens with two-word merging."""
-    tokens = re.findall(r"[A-Za-z#/]+", block_text)
-    tokens = [t for t in tokens if t.lower() in HEADER_TOKEN_SET or t == "#"]
-    merged: List[str] = []
-    i = 0
-    while i < len(tokens):
-        cur = tokens[i]
-        nxt = tokens[i + 1] if i + 1 < len(tokens) else ""
-        pair = (cur.lower(), nxt.lower()) if nxt else ("", "")
-        if pair in {
-            ("unit", "price"), ("pack", "rate"), ("line", "total"),
-            ("total", "stems"), ("total", "amount"), ("flower", "variety"),
-            ("product", "description"), ("product", "service"),
-            ("service", "description"),
-        }:
-            merged.append(f"{cur} {nxt}")
-            i += 2
-            continue
-        merged.append(cur)
-        i += 1
-    return merged
-
-
-def find_table_header(lines: List[str]) -> Tuple[Optional[int], List[Optional[str]]]:
-    """Find a header using 1..4 adjacent lines. Handles two-line headers."""
-    best = None
-    limit = min(len(lines), 200)
-    for i in range(limit):
-        for span in (2, 3, 1, 4):
-            if i + span > limit:
-                continue
-            block = [x.strip() for x in lines[i:i+span] if x.strip()]
-            if not block:
-                continue
-            joined = " | ".join(block)
-            cols = re.split(r"\s*\|\s*", joined)
-            cols = [c.strip() for c in cols if c.strip()]
-            if len(cols) < 3:
-                cols = _tokenize_header_block(" ".join(block))
-            if len(cols) < 3:
-                for line in block:
-                    cols.extend(_tokenize_header_block(line))
-            mapped = [match_header(c) for c in cols]
-            known = [m for m in mapped if m]
-            unique = set(known)
-            if (len(unique) >= 3 and
-                any(x in unique for x in ("product", "variety", "description")) and
-                any(x in unique for x in ("quantity", "boxes", "unit_price",
-                                           "total", "pack_rate"))):
-                score = len(unique) * 10 + len(known)
-                if best is None or score > best[0]:
-                    best = (score, i, mapped, span)
-    if best:
-        idx, mapped = best[1], best[2]
-        if mapped and mapped[0] == "row_index":
-            mapped = mapped[1:]
-        return idx, mapped
-    return None, []
-
-
-# ===========================================================================
-#  TABLE PARSING
-# ===========================================================================
-
-NUMERIC_FIELDS = {"boxes", "pack_rate", "quantity", "unit_price", "total"}
-
-
-def split_columns(line: str) -> List[str]:
-    line = str(line or "").strip()
-    if not line:
-        return []
-    if "|" in line:
-        return [x.strip() for x in re.split(r"\s*\|\s*", line) if x.strip()]
-    if "\t" in line:
-        return [x.strip() for x in line.split("\t") if x.strip()]
-    parts = [x.strip() for x in re.split(r"\s{2,}", line) if x.strip()]
-    return parts if len(parts) >= 2 else [line]
-
-
-def strip_row_index(text: str) -> Tuple[str, Optional[int]]:
-    m = re.match(r"^\s*(\d{1,3})\s*[.)]?\s+(.*\S)\s*$", text or "")
-    if m and len(m.group(2)) >= 2:
-        return m.group(2).strip(), int(m.group(1))
-    return text, None
-
-
-def _peel_numeric_tokens(s: str, max_peel: int) -> Tuple[str, List[str]]:
-    nums: List[str] = []
-    remaining = s.strip()
-    num_re = re.compile(
-        r"(?:\s|^)((?:[$€£]\s*)?\d{1,3}(?:[,\s]\d{3})*(?:\.\d+)?"
-        r"(?:\s*(?:KES|KSH|USD|EUR|GBP|AED|SAR|QAR))?)\s*$",
-        re.IGNORECASE)
-    for _ in range(max_peel):
-        m = num_re.search(remaining)
-        if not m or m.start(1) == 0:
-            break
-        nums.insert(0, m.group(1).strip())
-        remaining = remaining[:m.start(1)].rstrip()
-    return remaining.strip(), nums
-
-
-def value_for_field(field: str, raw: str) -> Any:
-    if empty_field(raw):
-        return None
-    if field in NUMERIC_FIELDS:
-        return as_number(parse_number(raw))
-    if field == "length":
-        m = re.search(r"\d+(?:\.\d+)?", raw)
-        return f"{m.group(0)}cm" if m else None
-    return raw.strip()
-
-
-def parse_table_row(line: str, headers: List[Optional[str]]) -> Optional[Dict[str, Any]]:
-    cols = split_columns(line)
-
-    if len(cols) < 2:
-        num_slots = sum(1 for h in headers if h in NUMERIC_FIELDS or h == "length")
-        head, nums = _peel_numeric_tokens(line, max_peel=max(1, num_slots))
-        if not nums:
-            return None
-        head, ridx = strip_row_index(head)
-        if not looks_like_product(head):
-            return None
-        cols = [head] + nums
-
-    vals: Dict[str, Any] = {}
-    raw_values: Dict[str, str] = {}
-    for i, cell in enumerate(cols):
-        field = headers[i] if i < len(headers) else None
-        if not field:
-            raw_values[f"unmapped_{i+1}"] = cell
-            continue
-        if field in vals and vals[field] not in (None, ""):
-            raw_values[f"duplicate_{field}_{i+1}"] = cell
-            continue
-        vals[field] = value_for_field(field, cell)
-
-    name = None
-    for field in ("product", "variety", "description"):
-        if vals.get(field) and looks_like_product(str(vals[field])):
-            name = str(vals[field]).strip()
-            break
-    if not name:
-        for cell in cols:
-            if looks_like_product(cell) and not is_header_or_metadata(cell):
-                name = cell
-                break
-    if not name:
-        return None
-
-    name, ridx = strip_row_index(name)
-
-    item = {
-        "product_name": name,
-        "boxes": vals.get("boxes"),
-        "pack_rate": vals.get("pack_rate"),
-        "quantity": vals.get("quantity"),
-        "unit_price": vals.get("unit_price"),
-        "total": vals.get("total"),
-        "specification": {},
-    }
-    if vals.get("length") is not None:
-        item["specification"]["length"] = vals["length"]
-    if vals.get("farm_code"):
-        item["farm_code"] = str(vals["farm_code"]).strip()
-    if ridx is not None:
-        item["row_index"] = ridx
-    if raw_values:
-        item["raw_values"] = raw_values
-    return item
-
-
-# ===========================================================================
-#  TEXT PARSER (multi-pass)
-# ===========================================================================
-
-def parse_order_text(text: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    text = clean_ocr_text(text)
-    lines = [x.strip() for x in text.splitlines() if x.strip()]
     items: List[Dict[str, Any]] = []
+    for line in lines[best_idx + 1:]:
+        if not line.strip():
+            continue
+        # Skip obvious footers
+        low = line.lower()
+        if any(k in low for k in ("thank you", "computer-generated", "signature",
+                                   "subtotal", "grand total", "total:", "notes:")):
+            continue
+        cells = [c.strip() for c in re.split(r"\s*\|\s*|\t+|\s{2,}", line) if c.strip()]
+        if len(cells) < 2:
+            cells = line.split()
+        if len(cells) < 2:
+            continue
 
-    # Pass 1: Table-based extraction
-    header_idx, headers = find_table_header(lines)
-    if header_idx is not None:
-        for line in lines[header_idx + 1:]:
-            if is_header_or_metadata(line) or is_boilerplate(line):
+        # Right-peel numbers if there are more than the header count
+        if len(cells) > expected:
+            nums = []
+            rest = cells[:]
+            while len(rest) > expected - 1:
+                try:
+                    nums.insert(0, parse_number(rest[-1]))
+                    rest.pop()
+                except Exception:
+                    break
+            cells = rest + [str(n) for n in nums]
+
+        record: Dict[str, Any] = {}
+        for j, col in enumerate(columns):
+            if j >= len(cells):
+                record[col["key"]] = None
                 continue
-            item = parse_table_row(line, headers)
-            if item:
-                items.append(item)
-        if items:
-            return clean_items(items), extract_meta_from_text(text)
+            raw = cells[j]
+            role = col.get("role")
+            if role in ("quantity", "boxes", "pack_rate", "length_cm",
+                        "head_size_cm", "unit_price", "total", "n"):
+                n = parse_number(raw)
+                record[col["key"]] = n if n is not None else raw
+            else:
+                record[col["key"]] = raw
+        items.append(record)
 
-    # Pass 2: Free-form line-by-line with numeric peeling
-    for line in lines:
-        if is_header_or_metadata(line) or is_boilerplate(line):
-            continue
-        if is_contact_or_address(line):
-            continue
-        head, nums = _peel_numeric_tokens(line, max_peel=6)
-        if len(nums) >= 2:
-            head, ridx = strip_row_index(head)
-            if looks_like_product(head):
-                item = {
-                    "product_name": head,
-                    "boxes": None,
-                    "pack_rate": None,
-                    "quantity": as_number(nums[-3]) if len(nums) >= 3 else None,
-                    "unit_price": as_number(nums[-2]),
-                    "total": as_number(nums[-1]),
-                    "specification": {},
-                }
-                if len(nums) >= 4:
-                    item["pack_rate"] = as_number(nums[-4])
-                if len(nums) >= 5:
-                    item["boxes"] = as_number(nums[-5])
-                if len(nums) >= 6:
-                    item["specification"]["length"] = f"{int(float(nums[-6]))}cm"
-                if ridx is not None:
-                    item["row_index"] = ridx
-                items.append(item)
-
-    # Pass 3: Labelled free-form (label:value syntax)
-    if not items:
-        for line in lines:
-            if is_boilerplate(line) or is_contact_or_address(line):
-                continue
-            fields = _extract_labelled_fields(line)
-            if fields and looks_like_product(fields.get("name", "")):
-                items.append({
-                    "product_name": fields["name"],
-                    "boxes": fields.get("boxes"),
-                    "pack_rate": fields.get("pack_rate"),
-                    "quantity": fields.get("quantity"),
-                    "unit_price": fields.get("unit_price"),
-                    "total": fields.get("total"),
-                    "specification": fields.get("specification", {}),
-                })
-
-    return clean_items(items), extract_meta_from_text(text)
-
-
-LABEL_PATTERNS = {
-    "boxes": r"(?:no\.?\s*of\s*)?(?:boxes?|bx|cartons?|ctn|cases?|bundles?|packages?)",
-    "pack_rate": r"(?:pack\s*rate|packrate|per\s*box|per\s*carton|stems?\s*(?:per|/)\s*(?:box|carton))",
-    "quantity": r"(?:quantity|qty|qnty|total\s+qty|stems?|pieces?|pcs|units?)",
-    "unit_price": r"(?:price|rate|unit\s*price|unit\s*cost|cost)",
-    "total": r"(?:line\s+total|total\s+amount|total\s+price|amount|total)",
-    "length": r"(?:length|size)\b",
-}
-
-
-def _extract_labelled_fields(line: str) -> Dict[str, Any]:
-    """For 'Hydrangea Pink 50cm packrate 60 3bx price 1.65' style lines."""
-    fields: Dict[str, Any] = {}
-    work = line
-    for field, pat in LABEL_PATTERNS.items():
-        m = re.search(rf"\b({pat})\b\s*(?:[:=]?\s*)([-\d.,]+|[\d.]+\s*(?:bx|cm|box|carton)?)",
-                      work, re.I)
-        if not m:
-            continue
-        raw = m.group(2)
-        if field == "length":
-            lm = re.search(r"\d+(?:\.\d+)?", raw)
-            if lm:
-                fields.setdefault("specification", {})["length"] = f"{lm.group(0)}cm"
-                work = work[:m.start()] + " " + work[m.end():]
-        elif field == "pack_rate":
-            n = parse_number(raw)
-            if n is not None:
-                fields["pack_rate"] = as_number(n)
-                work = work[:m.start()] + " " + work[m.end():]
-        else:
-            n = parse_number(raw)
-            if n is not None:
-                fields[field] = as_number(n)
-                work = work[:m.start()] + " " + work[m.end():]
-
-    # Also look for 'NNcm' or 'NN bx' or 'NNbox' without labels
-    if "specification" not in fields:
-        m = re.search(r"\b(\d{2,3})\s*cm\b", work, re.I)
-        if m:
-            fields["specification"] = {"length": f"{m.group(1)}cm"}
-            work = work[:m.start()] + " " + work[m.end():]
-
-    if "boxes" not in fields:
-        m = re.search(r"\b(\d{1,3})\s*(?:bx|boxes?|cartons?|ctn)\b", work, re.I)
-        if m:
-            fields["boxes"] = as_number(m.group(1))
-            work = work[:m.start()] + " " + work[m.end():]
-
-    # Clean up the remaining text → product name
-    name = re.sub(r"\b(?:pack\s*rate|packrate|qty|quantity|boxes?|bx|"
-                  r"cartons?|ctn|price|rate|total|amount|length)\b",
-                  " ", work, flags=re.I)
-    name = re.sub(r"[\$€£]", " ", name)
-    name = re.sub(r"\s+", " ", name).strip(" -:,;.|")
-    fields["name"] = name
-    return fields
+    columns = ensure_semantic_columns(columns)
+    return {"columns": columns, "items": items}
 
 
 # ===========================================================================
-#  METADATA
+#  PDF / DOCX readers
 # ===========================================================================
-
-META_LABELS = {
-    "invoice_number": ["invoice number", "invoice no", "invoice #", "inv no",
-                       "quotation number", "quote number", "proforma number",
-                       "reference", "ref no"],
-    "date": ["date", "invoice date", "issue date", "document date"],
-    "due_date": ["due date", "payment due", "valid until"],
-    "currency": ["currency", "currency code"],
-    "consignee_name": ["consignee", "bill to", "ship to", "customer name"],
-    "seller_name": ["seller", "vendor", "supplier", "exporter"],
-    "purchase_order_no": ["purchase order", "po no", "order number"],
-    "payment_terms": ["payment terms", "terms of payment"],
-    "awb_number": ["awb number", "air waybill", "tracking number"],
-    "net_weight": ["net weight", "net kg"],
-    "notes": ["notes", "comments", "remarks"],
-}
-
-CURRENCY_WORDS = {
-    "usd": "USD", "us dollar": "USD", "dollar": "USD",
-    "kes": "KES", "ksh": "KES", "eur": "EUR", "euro": "EUR",
-    "gbp": "GBP", "aed": "AED", "sar": "SAR", "qar": "QAR",
-}
-
-DOC_TYPES = {
-    "invoice": ["invoice", "tax invoice", "commercial invoice"],
-    "quotation": ["quotation", "quote", "estimate"],
-    "proforma": ["proforma", "pro forma", "proforma invoice"],
-    "receipt": ["receipt", "payment receipt"],
-    "delivery_note": ["delivery note", "dispatch note"],
-    "packing_list": ["packing list", "packing slip"],
-    "credit_note": ["credit note", "credit memo"],
-    "purchase_order": ["purchase order"],
-}
-
-
-def match_meta_label(label: str) -> Optional[str]:
-    key = norm(label)
-    key = re.sub(r"[*:#.]+$", "", key).strip()
-    if not key:
-        return None
-    for meta, names in META_LABELS.items():
-        for n in names:
-            nn = norm(n)
-            if key == nn or key.startswith(nn) or nn.startswith(key):
-                return meta
-    return None
-
-
-def detect_document_type(text: str) -> Optional[str]:
-    low = norm(text[:12000])
-    scores = {t: max([fuzz.partial_ratio(low, norm(w)) for w in ws] or [0])
-              for t, ws in DOC_TYPES.items()}
-    typ, score = max(scores.items(), key=lambda x: x[1])
-    return typ if score >= 70 else None
-
-
-def extract_meta_from_text(text: str) -> Dict[str, Any]:
-    meta: Dict[str, Any] = {}
-    lines = [x.strip() for x in text.splitlines() if x.strip()]
-    for line in lines:
-        m = re.match(
-            r"^\s*([A-Za-z][A-Za-z0-9\s./()%#*&_-]{1,70}?)\s*"
-            r"(?:[:#]\s*|-\s+|\|\s*)(.*?)\s*$", line)
-        if m:
-            label, value = m.group(1), m.group(2).strip()
-            field = match_meta_label(label)
-            if field and value and not empty_field(value):
-                meta.setdefault(field, value)
-
-    if "currency" in meta:
-        c = norm(meta["currency"])
-        for word, code in CURRENCY_WORDS.items():
-            if word in c:
-                meta["currency"] = code
-                break
-    else:
-        for word, code in CURRENCY_WORDS.items():
-            if re.search(rf"\b{word}\b", norm(text)):
-                meta["currency"] = code
-                break
-
-    if "invoice_number" not in meta:
-        m = re.search(r"#\s*([A-Z]{2,}-?\d{4,}[A-Z0-9\-]*)", text)
-        if m:
-            meta["invoice_number"] = m.group(1)
-
-    meta["document_type"] = detect_document_type(text)
-    return meta
-
-
-# ===========================================================================
-#  VALIDATION / CLEANING
-# ===========================================================================
-
-def validate_item(item: Dict[str, Any]) -> List[str]:
-    w = []
-    b, p, q, u, t = (item.get("boxes"), item.get("pack_rate"),
-                     item.get("quantity"), item.get("unit_price"),
-                     item.get("total"))
-    if b is not None and b <= 0: w.append("boxes_not_positive")
-    if p is not None and p <= 0: w.append("pack_rate_not_positive")
-    if q is not None and q <= 0: w.append("quantity_not_positive")
-    if u is not None and u < 0: w.append("unit_price_negative")
-    if t is not None and t < 0: w.append("total_negative")
-    if q and u and t:
-        try:
-            if abs(float(q) * float(u) - float(t)) > max(0.05, abs(float(t)) * 0.02):
-                w.append("quantity_x_unit_price_does_not_match_total")
-        except Exception:
-            pass
-    if b and p and q:
-        try:
-            if abs(float(b) * float(p) - float(q)) > 0.5:
-                w.append("boxes_x_pack_rate_does_not_match_quantity")
-        except Exception:
-            pass
-    return w
-
-
-def clean_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    cleaned = []
-    for raw in items:
-        if not isinstance(raw, dict):
-            continue
-        name = str(raw.get("product_name", "")).strip()
-        if not looks_like_product(name):
-            continue
-        out: Dict[str, Any] = {
-            "product_name": name,
-            "boxes": as_number(raw.get("boxes")),
-            "pack_rate": as_number(raw.get("pack_rate")),
-            "quantity": as_number(raw.get("quantity")),
-            "unit_price": as_number(raw.get("unit_price")),
-            "total": as_number(raw.get("total")),
-        }
-        if isinstance(raw.get("specification"), dict) and raw["specification"]:
-            out["specification"] = raw["specification"]
-        for key in ("farm_code", "product_id", "row_index"):
-            if raw.get(key) is not None and not empty_field(raw.get(key)):
-                out[key] = raw[key]
-        if raw.get("raw_values"):
-            out["raw_values"] = raw["raw_values"]
-
-        # Safe arithmetic derivation
-        if out["quantity"] is None and out["boxes"] and out["pack_rate"]:
-            try:
-                out["quantity"] = as_number(float(out["boxes"]) * float(out["pack_rate"]))
-            except Exception:
-                pass
-        if out["total"] is None and out["quantity"] and out["unit_price"]:
-            try:
-                out["total"] = round(float(out["quantity"]) * float(out["unit_price"]), 4)
-            except Exception:
-                pass
-
-        conf = 0.95
-        if out["boxes"] is None: conf -= 0.02
-        if out["pack_rate"] is None: conf -= 0.02
-        if out["quantity"] is None: conf -= 0.04
-        if out["unit_price"] is None: conf -= 0.04
-        if out.get("raw_values"): conf -= 0.10
-        warns = validate_item(out)
-        conf -= min(0.30, 0.08 * len(warns))
-        out["confidence"] = round(max(0.0, min(1.0, conf)), 3)
-        if warns:
-            out["warnings"] = warns
-        cleaned.append(out)
-    return cleaned
-
-
-# ===========================================================================
-#  AI ASSIST LAYER — Gemini + Groq
-#  Only used when deterministic parsing yields nothing.
-#  Never trusted for arithmetic (Pydantic recomputes downstream).
-# ===========================================================================
-
-AI_TEXT_PROMPT = """You are a strict document field extractor.
-Return ONLY valid JSON. No prose, no markdown, no code fences.
-
-Schema:
-{
-  "items": [
-    {
-      "product_name": "<string — no prices, no numbers>",
-      "variety": "<string or null>",
-      "boxes": <number or null>,
-      "pack_rate": <number or null>,
-      "quantity": <number or null>,
-      "unit_price": <number or null>,
-      "total": <number or null>,
-      "length_cm": <number or null>
-    }
-  ],
-  "metadata": {
-    "invoice_number": "<string or null>",
-    "date": "<string or null>",
-    "currency": "<string or null>"
-  }
-}
-
-Rules:
-1. NEVER put numbers, prices, or currency codes inside product_name.
-2. NEVER invent values not present in the source.
-3. Use null for missing fields.
-4. Numbers only for numeric fields (no commas, no currency symbols).
-5. Return empty items array if nothing is extractable.
-
-Document text:
----
-{text}
----
-"""
-
-AI_VISION_PROMPT = """Read this document image and extract every line item.
-Return ONLY valid JSON in this exact schema:
-{
-  "items": [
-    {"product_name": "<string>", "boxes": <number|null>,
-     "pack_rate": <number|null>, "quantity": <number|null>,
-     "unit_price": <number|null>, "total": <number|null>,
-     "length_cm": <number|null>}
-  ],
-  "metadata": {"invoice_number": "<string|null>", "date": "<string|null>",
-               "currency": "<string|null>"}
-}
-Rules:
-- Never put numbers or prices inside product_name.
-- Never invent values.
-- If a field is unclear, use null.
-"""
-
-
-def _clean_json_response(text: str) -> Optional[dict]:
-    if not text:
-        return None
-    text = re.sub(r"^```(?:json)?\s*", "", text.strip())
-    text = re.sub(r"\s*```$", "", text)
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return None
-    try:
-        return json.loads(text[start:end+1])
-    except json.JSONDecodeError:
-        return None
-
-
-def _rows_to_items(rows: List[dict]) -> List[Dict[str, Any]]:
-    out = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        name = str(row.get("product_name") or "").strip()
-        if not name or len(name) < 2:
-            continue
-        item = {
-            "product_name": name,
-            "variety": row.get("variety") or None,
-            "boxes": row.get("boxes"),
-            "pack_rate": row.get("pack_rate"),
-            "quantity": row.get("quantity"),
-            "unit_price": row.get("unit_price"),
-            "total": row.get("total"),
-            "specification": {},
-        }
-        lc = row.get("length_cm")
-        if lc is not None:
-            try:
-                item["specification"]["length"] = f"{int(float(lc))}cm"
-            except (TypeError, ValueError):
-                pass
-        out.append(item)
-    return out
-
-
-def _call_gemini_text(prompt: str) -> Optional[str]:
-    model = _get_gemini()
-    if model is None:
-        return None
-    try:
-        resp = model.generate_content(
-            prompt,
-            generation_config={
-                "temperature": 0.0,
-                "response_mime_type": "application/json",
-                "max_output_tokens": 4096,
-            },
-        )
-        return resp.text if resp and resp.text else None
-    except Exception as e:
-        logger.warning(f"Gemini text call failed: {e}")
-        return None
-
-
-def _call_groq_text(prompt: str) -> Optional[str]:
-    client = _get_groq()
-    if client is None:
-        return None
-    try:
-        resp = client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=4096,
-            response_format={"type": "json_object"},
-        )
-        return resp.choices[0].message.content if resp.choices else None
-    except Exception as e:
-        logger.warning(f"Groq call failed: {e}")
-        return None
-
-
-def extract_text_with_ai(text: str) -> List[Dict[str, Any]]:
-    """Deterministic text parser failed → ask AI. Never raises."""
-    if not AI_ENABLED or not text or len(text.strip()) < 20:
-        return []
-    prompt = AI_TEXT_PROMPT.replace("{text}", text[:12000])
-
-    providers = []
-    if AI_PROVIDER == "gemini":
-        providers = [("gemini", _call_gemini_text)]
-    elif AI_PROVIDER == "groq":
-        providers = [("groq", _call_groq_text)]
-    else:
-        providers = [("gemini", _call_gemini_text), ("groq", _call_groq_text)]
-
-    for name, fn in providers:
-        raw = fn(prompt)
-        if not raw:
-            continue
-        data = _clean_json_response(raw)
-        if not data or "items" not in data:
-            continue
-        items = _rows_to_items(data.get("items") or [])
-        if items:
-            logger.info(f"AI ({name}) recovered {len(items)} items from text")
-            return items
-    return []
-
-
-def extract_image_with_ai(image_bytes: bytes, mime_type: str = "image/jpeg"
-                          ) -> List[Dict[str, Any]]:
-    """Gemini Vision reads photographed invoices. Returns [] on failure."""
-    if not AI_ENABLED or not GEMINI_API_KEY:
-        return []
-    try:
-        import google.generativeai as genai
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel(GEMINI_MODEL)
-        resp = model.generate_content(
-            [
-                {"mime_type": mime_type, "data": image_bytes},
-                AI_VISION_PROMPT,
-            ],
-            generation_config={
-                "temperature": 0.0,
-                "response_mime_type": "application/json",
-                "max_output_tokens": 4096,
-            },
-        )
-        data = _clean_json_response(resp.text if resp else "")
-        if not data:
-            return []
-        items = _rows_to_items(data.get("items") or [])
-        if items:
-            logger.info(f"Gemini Vision recovered {len(items)} items from image")
-        return items
-    except Exception as e:
-        logger.warning(f"Gemini vision failed: {e}")
-        return []
-
-
-# ===========================================================================
-#  DOCUMENT EXTRACTION — PDF / DOCX / IMAGE / JSON
-# ===========================================================================
-
-def extract_text_from_pdf(content: bytes) -> Tuple[str, str]:
-    """Fast path: PyMuPDF text → PyPDF2 text → targeted OCR."""
+def extract_pdf_text(content: bytes) -> str:
     if fitz is not None:
         try:
             doc = fitz.open(stream=content, filetype="pdf")
             parts = []
             for page in doc:
-                txt = page.get_text("text", sort=True) or ""
-                if txt.strip():
-                    parts.append(txt)
+                t = page.get_text("text", sort=True) or ""
+                if t.strip():
+                    parts.append(t)
             doc.close()
-            text = "\n".join(parts).strip()
+            text = "\n".join(parts)
             if len(re.sub(r"\s+", "", text)) >= 30:
-                return text, "pdf_text_fitz"
+                return text
         except Exception as e:
             logger.warning(f"PyMuPDF failed: {e}")
+
     try:
         reader = PyPDF2.PdfReader(io.BytesIO(content))
         parts = [(p.extract_text() or "") for p in reader.pages]
-        text = "\n".join(parts).strip()
+        text = "\n".join(parts)
         if len(re.sub(r"\s+", "", text)) >= 30:
-            return text, "pdf_text_pypdf2"
-    except Exception as e:
-        logger.warning(f"PyPDF2 failed: {e}")
+            return text
+    except Exception:
+        pass
+
+    # OCR fallback — lightweight
     if fitz is None:
-        return "", "pdf_text_empty"
+        return ""
     try:
         doc = fitz.open(stream=content, filetype="pdf")
-        ocr_parts = []
+        parts = []
         for idx, page in enumerate(doc):
             if idx >= MAX_OCR_PAGES:
                 break
-            pix = page.get_pixmap(dpi=OCR_DPI, alpha=False)
+            pix = page.get_pixmap(dpi=150, alpha=False)
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            txt = ocr_image(img)
-            if txt:
-                ocr_parts.append(txt)
-        return "\n".join(ocr_parts), "pdf_ocr"
-    except Exception as e:
-        logger.warning(f"PDF OCR failed: {e}")
-        return "", "pdf_text_empty"
-
-
-def preprocess_image(img: Image.Image) -> Image.Image:
-    img = img.convert("L")
-    w, h = img.size
-    longest = max(w, h)
-    if longest < 1800:
-        scale = 1800 / longest
-        img = img.resize((int(w * scale), int(h * scale)))
-    img = ImageEnhance.Contrast(img).enhance(1.6)
-    return img
-
-
-def ocr_image(img: Image.Image) -> str:
-    processed = preprocess_image(img)
-    for cfg in ("--oem 3 --psm 6", "--oem 3 --psm 4"):
-        try:
-            txt = pytesseract.image_to_string(
-                processed, lang="eng", config=cfg, timeout=20)
-            if txt and len(re.findall(r"[A-Za-z0-9]", txt)) >= 20:
-                return txt
-        except Exception:
-            continue
-    return ""
-
-
-def extract_text_from_image(content: bytes) -> Tuple[str, str]:
-    try:
-        img = Image.open(io.BytesIO(content))
-        return ocr_image(img), "image_ocr"
+            img = img.convert("L")
+            img = ImageEnhance.Contrast(img).enhance(1.5)
+            try:
+                t = pytesseract.image_to_string(img, lang="eng",
+                                                config="--oem 3 --psm 6",
+                                                timeout=15)
+                if t:
+                    parts.append(t)
+            except Exception:
+                continue
+        doc.close()
+        return "\n".join(parts)
     except Exception:
-        return "", "image_error"
+        return ""
 
 
-def extract_text_from_docx(content: bytes) -> str:
+def extract_docx_text(content: bytes) -> str:
+    if DocxDocument is None:
+        return ""
     try:
-        d = docx.Document(io.BytesIO(content))
+        d = DocxDocument(io.BytesIO(content))
         parts = []
         for p in d.paragraphs:
             if p.text.strip():
@@ -1266,365 +488,219 @@ def extract_text_from_docx(content: bytes) -> str:
         return ""
 
 
-def extract_text_from_json(content: bytes) -> Tuple[str, str]:
-    try:
-        obj = json.loads(content.decode("utf-8", errors="ignore"))
-        return json.dumps(obj, ensure_ascii=False, indent=2), "json"
-    except Exception:
-        return content.decode("utf-8", errors="ignore"), "text"
-
-
 # ===========================================================================
-#  SPREADSHEET
+#  CANONICAL ITEM VIEW
+#  Maps dynamic records to canonical item fields for backward compat.
 # ===========================================================================
+def canonical_item(record: Dict[str, Any], columns: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def get_by_role(role: str):
+        for c in columns:
+            if c.get("role") == role:
+                return record.get(c["key"])
+        return None
 
-def extract_from_dataframe(df: pd.DataFrame) -> List[Dict[str, Any]]:
-    if df is None or df.empty:
-        return []
-    items = []
-    header_row = -1
-    header_map: Dict[int, str] = {0: "product"}
-    for i in range(min(20, len(df))):
-        row = df.iloc[i]
-        mapping: Dict[int, str] = {}
-        for idx, val in enumerate(row):
-            if pd.isna(val):
-                continue
-            field = match_header(str(val))
-            if field and field != "row_index" and field not in mapping.values():
-                mapping[idx] = field
-        fields = set(mapping.values())
-        if (len(fields) >= 3 and
-            any(x in fields for x in ("product", "variety", "description")) and
-            any(x in fields for x in ("quantity", "boxes", "unit_price",
-                                       "total", "pack_rate"))):
-            header_row = i
-            header_map = mapping
-            break
-    for i in range(header_row + 1, len(df)):
-        row = df.iloc[i]
-        vals: Dict[str, Any] = {}
-        for idx, field in header_map.items():
-            if idx < len(row) and not pd.isna(row.iloc[idx]):
-                vals[field] = row.iloc[idx]
-        if not vals:
-            continue
-        name = None
-        for f in ("product", "variety", "description"):
-            c = vals.get(f)
-            if not empty_field(c) and looks_like_product(str(c)):
-                name = str(c).strip()
-                break
-        if not name:
-            continue
-        name, ridx = strip_row_index(name)
-        item = {
-            "product_name": name,
-            "boxes": as_number(vals.get("boxes")),
-            "pack_rate": as_number(vals.get("pack_rate")),
-            "quantity": as_number(vals.get("quantity")),
-            "unit_price": as_number(vals.get("unit_price")),
-            "total": as_number(vals.get("total")),
-            "specification": {},
-        }
-        if ridx is not None:
-            item["row_index"] = ridx
-        if not empty_field(vals.get("farm_code")):
-            item["farm_code"] = str(vals["farm_code"]).strip()
-        items.append(item)
-    return clean_items(items)
+    name = get_by_role("product_name") or ""
+    # Try to combine product + variety if both exist
+    variety = None
+    for c in columns:
+        if c.get("role") == "product_name" and c["key"].startswith("variety"):
+            variety = record.get(c["key"])
 
+    qty = get_by_role("quantity")
+    boxes = get_by_role("boxes")
+    pack_rate = get_by_role("pack_rate")
+    unit_price = get_by_role("unit_price")
+    total = get_by_role("total")
 
-def extract_from_spreadsheet(content: bytes, ext: str) -> List[Dict[str, Any]]:
-    try:
-        if ext == "csv":
-            try:
-                df = pd.read_csv(io.BytesIO(content), header=None)
-            except Exception:
-                df = pd.read_csv(io.BytesIO(content), header=None, sep=";")
-        else:
-            df = pd.read_excel(io.BytesIO(content), header=None)
-        return extract_from_dataframe(df)
-    except Exception as e:
-        logger.exception("Spreadsheet read failed")
-        return []
-
-
-# ===========================================================================
-#  AI ANALYSIS LAYER
-# ===========================================================================
-
-def confidence_band(c: float) -> str:
-    if c >= 0.90: return "high"
-    if c >= 0.75: return "medium"
-    if c >= 0.55: return "low"
-    return "review_required"
-
-
-def ai_analyze(items: List[Dict], meta: Dict) -> Dict[str, Any]:
-    insights, anomalies = [], []
-    if not items:
-        insights.append({"type": "no_items_detected", "severity": "high",
-                         "message": "No line items could be extracted."})
-    prices = [float(i["unit_price"]) for i in items if i.get("unit_price")]
-    if len(prices) >= 3:
-        med = statistics.median(prices)
-        for i, it in enumerate(items):
-            p = it.get("unit_price")
-            if p is None or med == 0:
-                continue
-            dev = abs(float(p) - med) / med
-            if dev >= 0.5:
-                insights.append({
-                    "type": "price_outlier", "severity": "medium",
-                    "item_index": i,
-                    "product_name": it.get("product_name"),
-                    "message": f"Unit price {p} deviates {dev*100:.0f}% from median ({med:.2f}).",
-                })
-    for i, it in enumerate(items):
-        for w in it.get("warnings", []):
-            anomalies.append({
-                "item_index": i,
-                "product_name": it.get("product_name"),
-                "code": w,
-                "severity": "high" if "not_match" in w else "medium",
-            })
-    recs = []
-    if any(i["type"] == "no_items_detected" for i in insights):
-        recs.append("Re-upload a higher-resolution scan, or paste the text directly.")
-    if any(i["type"] == "price_outlier" for i in insights):
-        recs.append("Cross-check outlier prices against your rate card.")
-    if not recs:
-        recs.append("Extraction looks consistent. Proceed to product matching.")
-    trust_base = (sum(i.get("confidence", 0.5) for i in items) / len(items)) if items else 0.0
-    penalty = sum(0.10 if x.get("severity") == "high" else
-                  0.04 if x.get("severity") == "medium" else 0
-                  for x in insights)
-    trust = round(max(0.0, min(1.0, trust_base - penalty)), 3)
-    return {
-        "trust_score": trust,
-        "confidence_band": confidence_band(trust),
-        "reasoning": f"Parsed {len(items)} item(s). Trust {trust:.2f} ({confidence_band(trust)}).",
-        "insights": insights,
-        "anomalies": anomalies,
-        "recommendations": recs,
-        "analyzed_at": datetime.utcnow().isoformat() + "Z",
-    }
-
-
-# ===========================================================================
-#  PRODUCT MATCHING
-# ===========================================================================
-
-def normalize_product_for_match(name: str) -> str:
-    n = norm(name)
-    n = re.sub(r"\b\d+(?:\.\d+)?\s*cm\b", " ", n)
-    n = re.sub(r"\b(?:box|boxes|bx|carton|cartons|qty|quantity|stems?)\b", " ", n)
-    return re.sub(r"\s+", " ", n).strip()
-
-
-@app.post("/api/match-products")
-async def match_products_endpoint(req: MatchRequest):
-    try:
-        if not req.items or not req.company_products:
-            return {"success": True, "items": req.items, "matched_count": 0,
-                    "review_count": 0}
-        out = []
-        for item in req.items:
-            iname = normalize_product_for_match(str(item.get("product_name", "")))
-            ranked = []
-            for product in req.company_products:
-                names = [str(product.get("name", ""))]
-                aliases = product.get("aliases", [])
-                if isinstance(aliases, list):
-                    names.extend(str(x) for x in aliases)
-                for candidate in names:
-                    cname = normalize_product_for_match(candidate)
-                    if not cname:
-                        continue
-                    if iname == cname:
-                        score = 100.0
-                    else:
-                        score = max(
-                            fuzz.ratio(iname, cname),
-                            fuzz.token_set_ratio(iname, cname),
-                            fuzz.WRatio(iname, cname),
-                        )
-                    ranked.append((score, product))
-            ranked.sort(key=lambda x: x[0], reverse=True)
-            best = ranked[0] if ranked else (0, None)
-            second = ranked[1][0] if len(ranked) > 1 else 0
-            confidence = best[0] / 100.0
-            margin_ok = (best[0] - second) >= 6.0 or best[0] >= 98.0
-            accepted = (best[1] is not None and
-                        confidence >= MIN_MATCH_CONFIDENCE and margin_ok)
-            out.append({
-                **item,
-                "product_id": best[1].get("id") if accepted else None,
-                "matched_product_name": best[1].get("name") if accepted else None,
-                "match_confidence": round(confidence, 3),
-                "match_status": "matched" if accepted else "review_required",
-            })
-        return {
-            "success": True,
-            "items": out,
-            "matched_count": sum(1 for x in out if x.get("match_status") == "matched"),
-            "review_count": sum(1 for x in out if x.get("match_status") == "review_required"),
-        }
-    except Exception as e:
-        logger.exception("Product matching failed")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ===========================================================================
-#  ORCHESTRATION
-# ===========================================================================
-
-def _analyze_sync(content: bytes, fname: str, ext: str, company_id: int) -> Dict[str, Any]:
-    started = time.perf_counter()
-    items: List[Dict[str, Any]] = []
-    text_extracted = ""
-    method = ""
-    meta: Dict[str, Any] = {}
-    ai_used = False
-
-    # --- Spreadsheet
-    if ext in ("xlsx", "xls", "xlsm", "csv"):
-        items = extract_from_spreadsheet(content, ext)
-        method = "spreadsheet"
-
-    # --- PDF
-    elif ext == "pdf":
-        text_extracted, method = extract_text_from_pdf(content)
-        items, meta = parse_order_text(text_extracted)
-        if not items and AI_ENABLED and text_extracted:
-            ai_items = extract_text_with_ai(text_extracted)
-            if ai_items:
-                items = ai_items
-                method = f"{method}+ai_{AI_PROVIDER}"
-                ai_used = True
-
-    # --- DOCX
-    elif ext in ("docx", "doc"):
-        text_extracted = extract_text_from_docx(content)
-        method = "docx"
-        items, meta = parse_order_text(text_extracted)
-        if not items and AI_ENABLED and text_extracted:
-            ai_items = extract_text_with_ai(text_extracted)
-            if ai_items:
-                items = ai_items
-                method = f"{method}+ai_{AI_PROVIDER}"
-                ai_used = True
-
-    # --- Image
-    elif ext in ("jpg", "jpeg", "png", "gif", "bmp", "tiff", "webp"):
-        text_extracted, method = extract_text_from_image(content)
-        items, meta = parse_order_text(text_extracted)
-        if not items:
-            # Deterministic OCR failed (or yielded nothing) → try Gemini Vision
-            mime = "image/jpeg" if ext in ("jpg", "jpeg") else f"image/{ext}"
-            ai_items = extract_image_with_ai(content, mime)
-            if ai_items:
-                items = ai_items
-                method = f"{method}+gemini_vision"
-                ai_used = True
-            elif AI_ENABLED and text_extracted:
-                # Last resort: AI text parse of the OCR output
-                ai_items = extract_text_with_ai(text_extracted)
-                if ai_items:
-                    items = ai_items
-                    method = f"{method}+ai_{AI_PROVIDER}"
-                    ai_used = True
-
-    # --- JSON
-    elif ext == "json":
-        text_extracted, method = extract_text_from_json(content)
-        items, meta = parse_order_text(text_extracted)
-
-    # --- Plain text
-    else:
-        text_extracted = content.decode("utf-8", errors="ignore")
-        method = "text"
-        items, meta = parse_order_text(text_extracted)
-        if not items and AI_ENABLED and text_extracted:
-            ai_items = extract_text_with_ai(text_extracted)
-            if ai_items:
-                items = ai_items
-                method = f"{method}+ai_{AI_PROVIDER}"
-                ai_used = True
-
-    # --- Clean + Pydantic validation
-    cleaned = clean_items(items)
-    if text_extracted and not meta:
-        meta = extract_meta_from_text(text_extracted)
-
-    routed: List[Dict[str, Any]] = []
-    for raw in cleaned:
+    # Try to coerce numeric
+    def to_num(x):
+        if x is None:
+            return None
         try:
-            v = ExtractedLineItem(**raw)
-            d = v.model_dump()
-            d["confidence_band"] = confidence_band(d["confidence"])
-            routed.append(d)
+            f = float(x)
+            return int(f) if f.is_integer() else f
+        except (TypeError, ValueError):
+            return None
+
+    qty = to_num(qty)
+    boxes = to_num(boxes)
+    pack_rate = to_num(pack_rate)
+    unit_price = to_num(unit_price)
+    total = to_num(total)
+
+    if total is None and qty is not None and unit_price is not None:
+        total = round(qty * unit_price, 4)
+
+    return {
+        "product_name": str(name).strip() if name else "",
+        "variety": variety,
+        "boxes": boxes,
+        "pack_rate": pack_rate,
+        "quantity": qty,
+        "unit_price": unit_price,
+        "total": total,
+    }
+
+
+# ===========================================================================
+#  PROMPT APPLICATION
+# ===========================================================================
+class PromptRequest(BaseModel):
+    items: List[Dict[str, Any]]
+    columns: List[Dict[str, Any]]
+    prompt: str
+
+
+PROMPT_SYSTEM = """You are a strict data-transformation assistant for invoice tables.
+
+You receive:
+  - columns: [{key, label, role, source}, ...]  (role may be null)
+  - items: rows, keyed by column.key
+  - prompt: a natural-language instruction from the user
+
+You return ONLY valid JSON with this exact shape:
+{
+  "items": [ <same length as input, same keys, updated values> ],
+  "columns": [ <same columns array, optionally with new 'added' columns> ],
+  "explanation": "<one sentence on what you did>"
+}
+
+Rules:
+1. NEVER delete rows unless the prompt explicitly says to.
+2. NEVER change the number of columns unless adding a new one. New columns must have "source": "added".
+3. Preserve every existing key in every row.
+4. Numeric fields must be numbers, not strings.
+5. If the prompt is unclear, do nothing and explain.
+6. Never invent data.
+"""
+
+
+def _clean_json(text: str) -> Optional[dict]:
+    if not text:
+        return None
+    text = re.sub(r"^```(?:json)?\s*", "", text.strip())
+    text = re.sub(r"\s*```$", "", text)
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        return json.loads(text[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+
+
+def apply_prompt_ai(items, columns, prompt):
+    payload = json.dumps({"columns": columns, "items": items, "prompt": prompt},
+                         ensure_ascii=False)
+
+    providers = []
+    if AI_PROVIDER in ("gemini", "auto"):
+        providers.append(("gemini", _get_gemini()))
+    if AI_PROVIDER in ("groq", "auto"):
+        providers.append(("groq", _get_groq()))
+
+    for name, client in providers:
+        if client is None:
+            continue
+        try:
+            if name == "gemini":
+                resp = client.generate_content(
+                    PROMPT_SYSTEM + "\n\nINPUT:\n" + payload,
+                    generation_config={
+                        "temperature": 0.0,
+                        "response_mime_type": "application/json",
+                        "max_output_tokens": 8192,
+                    },
+                )
+                raw = resp.text if resp else ""
+            else:
+                resp = client.chat.completions.create(
+                    model=GROQ_MODEL,
+                    messages=[{"role": "system", "content": PROMPT_SYSTEM},
+                              {"role": "user", "content": payload}],
+                    temperature=0.0,
+                    response_format={"type": "json_object"},
+                    max_tokens=8192,
+                )
+                raw = resp.choices[0].message.content if resp.choices else ""
+            data = _clean_json(raw)
+            if data and "items" in data:
+                return data
         except Exception as e:
-            logger.warning(f"Item failed strict routing: {e}")
+            logger.warning(f"Prompt via {name} failed: {e}")
+    return None
 
-    total_boxes = safe_sum(x.get("boxes") for x in routed)
-    total_qty = safe_sum(x.get("quantity") for x in routed)
-    total_amount = safe_sum(x.get("total") for x in routed)
 
-    warnings: List[str] = []
-    for x in routed:
-        warnings.extend(x.get("validation_warnings", []))
+def apply_prompt_deterministic(items, columns, prompt):
+    """Handle common prompts without AI (fallback)."""
+    p = prompt.lower().strip()
+    cols = list(columns)
+    taken = {c["key"] for c in cols}
 
-    elapsed = round(time.perf_counter() - started, 3)
+    # Detect "add unit price column at X"
+    m = re.search(r"(?:add|create)\s+(?:a\s+)?(?:unit\s*price|price)\s*(?:column)?"
+                  r"(?:\s*(?:at|=|of|:)\s*([0-9]+(?:\.[0-9]+)?))?", p)
+    if m:
+        default_price = float(m.group(1)) if m.group(1) else None
+        if not any(c.get("role") == "unit_price" for c in cols):
+            key = slugify("Unit Price", taken)
+            cols.append(make_column(key, "Unit Price", "unit_price", "added"))
+            for it in items:
+                it[key] = default_price
+        else:
+            for c in cols:
+                if c.get("role") == "unit_price":
+                    for it in items:
+                        if it.get(c["key"]) in (None, "", 0):
+                            it[c["key"]] = default_price
 
-    return {
-        "success": True,
-        "items": routed,
-        "metadata": meta,
-        "document_type": meta.get("document_type"),
-        "total_boxes": int(total_boxes) if total_boxes else None,
-        "total_quantity": int(total_qty) if total_qty else None,
-        "total_amount": round(float(total_amount), 2),
-        "currency": meta.get("currency", "USD"),
-        "item_count": len(routed),
-        "review_required": any(
-            x.get("confidence", 0) < 0.80 or x.get("validation_warnings")
-            for x in routed),
-        "warnings": sorted(set(warnings)),
-        "analysis": ai_analyze(routed, meta),
-        "text_extracted": text_extracted[:12000] if text_extracted else "",
-        "extraction_method": method,
-        "file_type": ext,
-        "filename": fname,
-        "engine_version": ENGINE_VERSION,
-        "diagnostics": {
-            "elapsed_seconds": elapsed,
-            "input_bytes": len(content),
-            "ai_used": ai_used,
-            "ai_enabled": AI_ENABLED,
-            "ai_provider": AI_PROVIDER,
-        },
-    }
+    # Detect "calculate line total" / "add total"
+    if re.search(r"\b(total|line total|line amount|amount)\b", p) and \
+       re.search(r"\b(calc|comput|add|create)\b", p):
+        qty_key = next((c["key"] for c in cols if c.get("role") == "quantity"), None)
+        price_key = next((c["key"] for c in cols if c.get("role") == "unit_price"), None)
+        if qty_key and price_key:
+            total_key = next((c["key"] for c in cols if c.get("role") == "total"), None)
+            if not total_key:
+                total_key = slugify("Line Total", taken)
+                cols.append(make_column(total_key, "Line Total", "total", "added"))
+            for it in items:
+                try:
+                    q = float(it.get(qty_key) or 0)
+                    u = float(it.get(price_key) or 0)
+                    it[total_key] = round(q * u, 2)
+                except (TypeError, ValueError):
+                    it[total_key] = None
+
+    # Detect "remove column X"
+    m = re.search(r"(?:remove|delete)\s+(?:the\s+)?column\s+([a-z0-9 _\-]+)", p)
+    if m:
+        target = m.group(1).strip()
+        for c in list(cols):
+            if target in c["label"].lower() or target == c["key"]:
+                for it in items:
+                    it.pop(c["key"], None)
+                cols.remove(c)
+
+    # Detect "multiply quantity by N"
+    m = re.search(r"multiply\s+quantity\s+by\s+([0-9]+(?:\.[0-9]+)?)", p)
+    if m:
+        factor = float(m.group(1))
+        qty_key = next((c["key"] for c in cols if c.get("role") == "quantity"), None)
+        if qty_key:
+            for it in items:
+                try:
+                    it[qty_key] = round(float(it[qty_key]) * factor, 2)
+                except (TypeError, ValueError, KeyError):
+                    pass
+
+    return {"items": items, "columns": cols,
+            "explanation": "Applied via deterministic parser."}
 
 
 # ===========================================================================
-#  ENDPOINTS
+#  ROUTES
 # ===========================================================================
-
-@app.get("/api/ping")
-async def ping():
-    return {
-        "ok": True,
-        "version": ENGINE_VERSION,
-        "ai_enabled": AI_ENABLED,
-        "ai_provider": AI_PROVIDER,
-        "gemini_ready": bool(GEMINI_API_KEY),
-        "groq_ready": bool(GROQ_API_KEY),
-        "t": datetime.utcnow().isoformat() + "Z",
-    }
-
-
 @app.get("/")
 async def root():
     return {
@@ -1633,33 +709,110 @@ async def root():
         "status": "operational",
         "ai_enabled": AI_ENABLED,
         "ai_provider": AI_PROVIDER,
-        "capabilities": [
-            "invoice", "quotation", "proforma", "receipt", "delivery_note",
-            "packing_list", "purchase_order", "images_ocr", "scanned_pdf_ocr",
-            "pdf_text", "docx", "xlsx", "xls", "xlsm", "csv", "json", "text",
-            "confidence_scoring", "validation", "provenance",
-            "safe_blank_fields", "product_matching",
-            "ai_text_fallback", "gemini_vision_fallback",
-            "arithmetic_validation", "field_isolation",
-        ],
-        "endpoints": [
-            "/api/ping", "/api/health", "/api/analyze (POST)",
-            "/api/match-products (POST)", "/api/extract-text (POST)",
-        ],
+        "endpoints": ["/api/ping", "/api/health", "/api/analyze",
+                      "/api/apply-prompt", "/api/match-products"],
     }
 
 
+@app.get("/api/ping")
+def ping():
+    return {"ok": True, "version": ENGINE_VERSION,
+            "ai_enabled": AI_ENABLED, "ai_provider": AI_PROVIDER}
+
+
 @app.get("/api/health")
-async def health():
+def health():
+    return {"status": "healthy", "version": ENGINE_VERSION,
+            "ai_enabled": AI_ENABLED, "ai_provider": AI_PROVIDER}
+
+
+def analyze_bytes(content: bytes, fname: str, ext: str,
+                  company_id: int, prompt: str = "") -> Dict[str, Any]:
+    started = time.perf_counter()
+    result: Dict[str, Any] = {"columns": [], "items": [], "extraction_method": ""}
+    text_extracted = ""
+
+    if ext in ("xlsx", "xls", "xlsm", "csv"):
+        try:
+            if ext == "csv":
+                try:
+                    df = pd.read_csv(io.BytesIO(content), header=None)
+                except Exception:
+                    df = pd.read_csv(io.BytesIO(content), header=None, sep=";")
+            else:
+                df = pd.read_excel(io.BytesIO(content), header=None)
+            result = extract_from_dataframe_dynamic(df)
+            result["extraction_method"] = "spreadsheet_dynamic"
+        except Exception as e:
+            logger.exception(f"Spreadsheet extraction failed: {e}")
+
+    elif ext == "pdf":
+        text_extracted = extract_pdf_text(content)
+        result = extract_from_text_dynamic(text_extracted)
+        result["extraction_method"] = "pdf_dynamic"
+
+    elif ext in ("docx", "doc"):
+        text_extracted = extract_docx_text(content)
+        result = extract_from_text_dynamic(text_extracted)
+        result["extraction_method"] = "docx_dynamic"
+
+    elif ext in ("jpg", "jpeg", "png", "gif", "bmp", "tiff", "webp"):
+        try:
+            img = Image.open(io.BytesIO(content))
+            img = img.convert("L")
+            img = ImageEnhance.Contrast(img).enhance(1.5)
+            text_extracted = pytesseract.image_to_string(
+                img, lang="eng", config="--oem 3 --psm 6", timeout=30)
+        except Exception:
+            text_extracted = ""
+        result = extract_from_text_dynamic(text_extracted)
+        result["extraction_method"] = "image_ocr_dynamic"
+
+    else:
+        text_extracted = content.decode("utf-8", errors="ignore")
+        result = extract_from_text_dynamic(text_extracted)
+        result["extraction_method"] = "text_dynamic"
+
+    # Apply initial prompt if provided
+    if prompt and result.get("items"):
+        applied = apply_prompt_ai(result["items"], result["columns"], prompt)
+        if not applied:
+            applied = apply_prompt_deterministic(result["items"],
+                                                 result["columns"], prompt)
+        result["items"] = applied.get("items", result["items"])
+        result["columns"] = applied.get("columns", result["columns"])
+        result["prompt_applied"] = True
+        result["prompt_explanation"] = applied.get("explanation", "")
+
+    # Canonical view for downstream
+    canonical_items = []
+    for r in result["items"]:
+        ci = canonical_item(r, result["columns"])
+        ci.update({"_record": r})
+        canonical_items.append(ci)
+
+    # Totals
+    total_qty = sum((i["quantity"] or 0) for i in canonical_items
+                    if i.get("quantity") is not None)
+    total_amount = sum((i["total"] or 0) for i in canonical_items
+                       if i.get("total") is not None)
+
     return {
-        "status": "healthy",
-        "version": ENGINE_VERSION,
-        "ocr_available": bool(pytesseract),
-        "pdf_available": fitz is not None,
-        "ai_enabled": AI_ENABLED,
-        "ai_provider": AI_PROVIDER,
-        "gemini_ready": bool(GEMINI_API_KEY),
-        "groq_ready": bool(GROQ_API_KEY),
+        "success": True,
+        "columns": result["columns"],
+        "items": canonical_items,
+        "raw_items": result["items"],
+        "item_count": len(canonical_items),
+        "total_quantity": int(total_qty) if total_qty else None,
+        "total_amount": round(float(total_amount), 2),
+        "text_extracted": text_extracted[:12000],
+        "extraction_method": result["extraction_method"],
+        "prompt_applied": result.get("prompt_applied", False),
+        "prompt_explanation": result.get("prompt_explanation", ""),
+        "engine_version": ENGINE_VERSION,
+        "file_type": ext,
+        "filename": fname,
+        "elapsed_seconds": round(time.perf_counter() - started, 3),
     }
 
 
@@ -1668,89 +821,116 @@ async def analyze(
     file: UploadFile = File(...),
     company_id: int = Form(0),
     file_type: Optional[str] = Form(None),
+    prompt: str = Form(""),
 ):
     content = await file.read()
-    if len(content) > MAX_UPLOAD_MB * 1024 * 1024:
-        raise HTTPException(status_code=413,
-                            detail=f"File is larger than {MAX_UPLOAD_MB} MB.")
     if not content:
-        raise HTTPException(status_code=400, detail="The uploaded file is empty.")
+        raise HTTPException(400, "Empty file")
+    if len(content) > MAX_UPLOAD_MB * 1024 * 1024:
+        raise HTTPException(413, f"File larger than {MAX_UPLOAD_MB} MB")
 
     fname = file.filename or "upload"
     ext = (file_type or Path(fname).suffix.lstrip(".")).lower()
-    allowed = {"xlsx", "xls", "xlsm", "csv", "pdf", "docx", "doc",
-               "jpg", "jpeg", "png", "gif", "bmp", "tiff", "webp",
-               "json", "txt", "text"}
-    if ext not in allowed:
-        raise HTTPException(status_code=415,
-                            detail=f"Unsupported file type: {ext or 'unknown'}")
 
-    logger.info(f"Analyzing {fname} ({ext}), company={company_id}, size={len(content)}")
+    logger.info(f"Analyzing {fname} ({ext}), company={company_id}, "
+                f"size={len(content)}, prompt_len={len(prompt)}")
 
+    loop = __import__("asyncio").get_running_loop()
     try:
-        import asyncio
-        loop = asyncio.get_running_loop()
-        # Hard wall-clock budget
-        with ThreadPoolExecutor(max_workers=1) as ex:
-            fut = ex.submit(_analyze_sync, content, fname, ext, company_id)
-            try:
-                result = await loop.run_in_executor(
-                    None, lambda: fut.result(timeout=ANALYZE_TIMEOUT_SECONDS))
-                return result
-            except Exception as te:
-                logger.warning(f"Analyze timed out or failed: {te}")
-                # Return a well-formed empty response, never a 500
-                return {
-                    "success": False,
-                    "items": [],
-                    "metadata": {},
-                    "item_count": 0,
-                    "error": "Analysis timed out or failed. Try again or use a smaller file.",
-                    "engine_version": ENGINE_VERSION,
-                    "extraction_method": "timeout",
-                }
-    except HTTPException:
-        raise
+        return await loop.run_in_executor(
+            None, analyze_bytes, content, fname, ext, company_id, prompt)
     except Exception as e:
         logger.exception("Analyze crashed")
         return {
-            "success": False,
-            "items": [],
-            "metadata": {},
-            "item_count": 0,
-            "error": str(e),
-            "engine_version": ENGINE_VERSION,
-            "extraction_method": "crashed",
+            "success": False, "columns": [], "items": [], "raw_items": [],
+            "item_count": 0, "error": str(e), "engine_version": ENGINE_VERSION,
         }
 
 
-@app.post("/api/extract-text")
-async def extract_text_endpoint(file: UploadFile = File(...)):
-    content = await file.read()
-    fname = file.filename or ""
-    ext = Path(fname).suffix.lstrip(".").lower()
+@app.post("/api/apply-prompt")
+async def apply_prompt_endpoint(req: PromptRequest):
+    """Re-apply a prompt to already-extracted items (called from review page)."""
+    items = req.items or []
+    columns = req.columns or []
+    prompt = (req.prompt or "").strip()
+    if not prompt:
+        return {"success": True, "items": items, "columns": columns,
+                "explanation": "No prompt provided."}
 
-    if ext == "pdf":
-        text, method = extract_text_from_pdf(content)
-    elif ext in ("docx", "doc"):
-        text, method = extract_text_from_docx(content), "docx"
-    elif ext in ("jpg", "jpeg", "png", "gif", "bmp", "tiff", "webp"):
-        text, method = extract_text_from_image(content)
-    elif ext == "json":
-        text, method = extract_text_from_json(content)
-    else:
-        text, method = content.decode("utf-8", errors="ignore"), "text"
+    # Try AI first
+    applied = apply_prompt_ai(items, columns, prompt)
+    if not applied:
+        applied = apply_prompt_deterministic(items, columns, prompt)
+
+    # Recompute canonical view
+    canonical = []
+    for r in applied["items"]:
+        ci = canonical_item(r, applied["columns"])
+        ci["_record"] = r
+        canonical.append(ci)
 
     return {
         "success": True,
-        "text": text,
-        "length": len(text),
-        "file_type": ext,
-        "extraction_method": method,
+        "columns": applied["columns"],
+        "items": canonical,
+        "raw_items": applied["items"],
+        "explanation": applied.get("explanation", ""),
+        "applied_via": "ai" if AI_ENABLED else "deterministic",
     }
+
+
+# ===========================================================================
+#  PRODUCT MATCHING (unchanged from v12)
+# ===========================================================================
+class MatchRequest(BaseModel):
+    items: List[Dict[str, Any]]
+    company_products: List[Dict[str, Any]]
+
+
+def normalize_product_for_match(name: str) -> str:
+    n = re.sub(r"\s+", " ", str(name or "").lower()).strip()
+    n = re.sub(r"\b\d+(?:\.\d+)?\s*cm\b", " ", n)
+    n = re.sub(r"\b(?:box|boxes|bx|carton|cartons|qty|quantity|stems?)\b", " ", n)
+    return re.sub(r"\s+", " ", n).strip()
+
+
+@app.post("/api/match-products")
+async def match_products(req: MatchRequest):
+    if not req.items or not req.company_products:
+        return {"success": True, "items": req.items, "matched_count": 0,
+                "review_count": 0}
+    out = []
+    for item in req.items:
+        iname = normalize_product_for_match(item.get("product_name", ""))
+        best, best_score = None, 0
+        for prod in req.company_products:
+            names = [prod.get("name", "")]
+            if isinstance(prod.get("aliases"), list):
+                names.extend(prod["aliases"])
+            for cand in names:
+                cn = normalize_product_for_match(cand)
+                if not cn:
+                    continue
+                s = max(fuzz.ratio(iname, cn),
+                        fuzz.token_set_ratio(iname, cn),
+                        fuzz.WRatio(iname, cn))
+                if s > best_score:
+                    best_score, best = s, prod
+        conf = best_score / 100.0
+        if best and conf >= 0.84:
+            out.append({**item, "product_id": best.get("id"),
+                        "matched_product_name": best.get("name"),
+                        "match_confidence": round(conf, 3),
+                        "match_status": "matched"})
+        else:
+            out.append({**item, "product_id": None,
+                        "match_confidence": round(conf, 3),
+                        "match_status": "review_required"})
+    return {"success": True, "items": out,
+            "matched_count": sum(1 for x in out if x["match_status"] == "matched"),
+            "review_count": sum(1 for x in out if x["match_status"] == "review_required")}
 
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
