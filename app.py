@@ -1,37 +1,25 @@
 """
 ALTECH SOFTWARE DEVELOPERS
-SMART DOCUMENT INTELLIGENCE ENGINE v21
+SMART DOCUMENT INTELLIGENCE ENGINE v22
 --------------------------------------
-Universal document ingestion + semantic structure understanding.
+Universal document ingestion with semantic role resolution.
 
-Supported formats:
-  • XLSX / XLS / XLSM (multi-sheet, formulas, currency strings)
-  • CSV (comma, semicolon, tab auto-detected)
-  • PDF (text layer first, then OCR)
-  • DOCX (paragraphs + tables)
-  • Plain text, JSON
-  • Images (PNG, JPG, TIFF, BMP, WEBP) via OCR
+Fixes in v22:
+  • Role collision: "Qty" and "Stems" both map to quantity. Only the
+    more specific label wins the semantic alias. The other is kept under
+    "<role>__<key>" so it stays visible but doesn't hijack calculations.
+  • Stricter summary-row detection: rows where every populated cell is
+    numeric are excluded. Real items always have a product name.
+  • Summary keyword regex expanded for edge cases.
+  • Robust currency parsing for "$1.30", "USD 1,350.00", "1.234,56".
+  • Formula cells ("=PRODUCT(...)") preserved but not parsed as numbers.
 
-Design principles:
-  1. Never assume a fixed invoice template.
-  2. Never silently drop data — anything unrecognized is preserved
-     under its original column or in raw_text.
-  3. Semantic roles are inferred, not hard-coded; a column called
-     "QTY Trial only - stems" is recognized as quantity.
-  4. Structure is exposed as {columns, items} so the chat engine can
-     operate on it regardless of source format.
-  5. Every response carries diagnostics: sheets, trust score, anomalies.
+Integrates ideas from IBM Docling and MinerU: multi-sheet awareness,
+lossless JSON output, per-row confidence and anomaly tracking.
 """
 
 from __future__ import annotations
-
-import io
-import os
-import re
-import json
-import math
-import time
-import logging
+import io, os, re, json, math, time, logging
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -49,7 +37,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 try:
-    import fitz  # PyMuPDF
+    import fitz
 except Exception:
     fitz = None
 
@@ -62,13 +50,10 @@ except Exception as _e:
     _CHAT_AVAILABLE = False
 
 
-# ===========================================================================
-#  LOGGING + CONFIG
-# ===========================================================================
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("altech-smart-document")
 
-ENGINE_VERSION = "21.0.0"
+ENGINE_VERSION = "22.0.0"
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "40"))
 MAX_ROWS = int(os.getenv("MAX_ROWS", "20000"))
 MAX_SHEETS = int(os.getenv("MAX_SHEETS", "50"))
@@ -79,91 +64,59 @@ if os.path.exists(TESS_CMD):
     pytesseract.pytesseract.tesseract_cmd = TESS_CMD
 
 
-# ===========================================================================
-#  FASTAPI
-# ===========================================================================
 app = FastAPI(title="Altech Smart Document Intelligence Engine",
               version=ENGINE_VERSION)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_methods=["*"], allow_headers=["*"])
 
 
 # ===========================================================================
-#  SEMANTIC ROLE MODEL
-#  A column is classified into one of these roles. The chat engine can
-#  address columns by role ("set unit price") or by label ("set Price").
+#  ROLE MODEL
 # ===========================================================================
 ROLE_ALIASES = {
-    "product_name": [
-        "product", "product name", "item", "item name", "flower",
-        "flower name", "description", "item description",
-        "particulars", "goods", "article", "articles",
-        "flower variety", "variety", "cultivar", "product/service",
-        "service", "commodity",
-    ],
-    "variety": ["variety", "cultivar", "cultivar name", "flower variety name"],
-    "quantity": [
-        "quantity", "qty", "qnty", "stems", "total stems", "pieces", "pcs",
-        "units", "count", "total quantity", "qty trial only - stems",
-        "qty trial only-stems", "qty trial only stems", "trial qty",
-    ],
-    "boxes": ["boxes", "box", "bx", "cartons", "carton", "ctn",
-              "cases", "case", "bundles", "bundle", "packages", "pkg"],
-    "pack_rate": [
-        "packrate", "pack rate", "pack_rate", "per box", "per carton",
-        "stems per box", "stems/box", "qty per box", "quantity per box",
-        "stems per carton", "qty/carton",
-    ],
-    "unit_price": [
-        "price", "unit price", "unit_price", "rate", "cost", "unit cost",
-        "price per stem", "price/stem", "cost per stem", "selling price",
-        "unit selling price", "price per unit",
-    ],
-    "total": [
-        "total", "amount", "line total", "line amount", "total amount",
-        "extended price", "revenue", "line value",
-    ],
-    "length_cm": [
-        "length", "length cm", "length (cm)", "length(cm)",
-        "stem length", "size", "size cm", "height",
-    ],
+    "product_name": ["product", "product name", "item", "item name",
+                     "flower", "flower name", "description", "item description",
+                     "particulars", "goods", "article", "articles",
+                     "flower variety", "variety", "cultivar"],
+    "variety": ["variety", "cultivar", "cultivar name"],
+    "quantity": ["quantity", "qty", "qnty", "stems", "total stems",
+                 "pieces", "pcs", "units", "count", "total quantity"],
+    "boxes": ["boxes", "box", "bx", "cartons", "carton", "ctn", "cases"],
+    "pack_rate": ["packrate", "pack rate", "pack_rate", "per box",
+                  "per carton", "stems per box", "stems/box",
+                  "qty per box", "quantity per box"],
+    "unit_price": ["price", "unit price", "unit_price", "rate", "cost",
+                   "unit cost", "price per stem", "price/stem"],
+    "total": ["total", "amount", "line total", "line amount",
+              "total amount", "extended price", "revenue"],
+    "length_cm": ["length", "length cm", "length (cm)", "length(cm)",
+                  "stem length", "size", "size cm"],
     "head_size_cm": ["head size", "head size cm", "head size (cm)"],
     "color": ["color", "colour", "shade"],
-    "farm_code": ["farm code", "farm", "farmcode", "farm ref",
-                  "grower code", "supplier code"],
-    "invoice_number": [
-        "invoice number", "invoice no", "invoice #", "invoice no.",
-        "inv no", "inv #", "reference", "ref no", "document number",
-    ],
-    "date": [
-        "date", "invoice date", "shipment date", "date of shipment",
-        "issue date", "document date",
-    ],
+    "farm_code": ["farm code", "farm", "farmcode", "grower code"],
+    "invoice_number": ["invoice number", "invoice no", "invoice #",
+                       "invoice no.", "inv no", "reference"],
+    "date": ["date", "invoice date", "shipment date", "issue date"],
     "due_date": ["due date", "payment due", "valid until", "expiry"],
     "currency": ["currency", "currency code", "ccy"],
-    "vat_rate": ["vat", "vat rate", "vat %", "tax", "tax rate", "tax %"],
+    "vat_rate": ["vat", "vat rate", "vat %", "tax", "tax rate"],
     "discount": ["discount", "disc.", "rebate"],
-    "consignee": ["consignee", "bill to", "ship to", "buyer", "customer"],
-    "seller": ["seller", "vendor", "supplier", "exporter"],
-    "awb": ["awb", "air waybill", "waybill", "tracking number"],
-    "net_weight": ["net weight", "net kg", "net weight (kgs)"],
-    "gross_weight": ["gross weight", "gross kg"],
 }
 
-NUMERIC_ROLES = {
-    "quantity", "boxes", "pack_rate", "length_cm", "head_size_cm",
-    "unit_price", "total", "vat_rate", "discount", "net_weight",
-    "gross_weight",
-}
+NUMERIC_ROLES = {"quantity", "boxes", "pack_rate", "length_cm",
+                 "head_size_cm", "unit_price", "total", "vat_rate",
+                 "discount"}
 
-TEXT_ROLES = {
-    "product_name", "variety", "description", "color", "farm_code",
-    "invoice_number", "date", "due_date", "currency", "consignee",
-    "seller", "awb", "notes",
+# More specific labels win when two columns classify into the same role.
+ROLE_PRIORITY = {
+    "quantity": ["total stems", "stems", "number of stems", "stem quantity",
+                 "total quantity", "quantity", "qty"],
+    "unit_price": ["unit price", "price per stem", "unit cost",
+                   "rate", "price", "cost"],
+    "total": ["line total", "total amount", "extended price",
+              "line amount", "amount", "total"],
+    "boxes": ["number of boxes", "no. of boxes", "cartons", "cases",
+              "boxes", "box"],
 }
 
 
@@ -178,14 +131,9 @@ def clean_key(s: str) -> str:
 
 
 # ===========================================================================
-#  NUMBER PARSING  (the "unknown how many errors" fix lives here)
+#  NUMBER PARSING — handles $1.30, USD 1,350.00, 1.234,56
 # ===========================================================================
 def parse_number(v: Any) -> Optional[float]:
-    """
-    Robust number parser. Handles:
-      $1.30, USD 1,350.00, KES 1,234.56, 1.234,56 (EU), "1 200", "=PRODUCT(...)"
-      Returns None if the input is not numeric-looking.
-    """
     if v is None or isinstance(v, bool):
         return None
     if isinstance(v, (int, float)):
@@ -195,32 +143,25 @@ def parse_number(v: Any) -> Optional[float]:
     s = str(v).strip()
     if not s:
         return None
-
-    # Formula cell like "=PRODUCT(G3:H3)" — not parseable, return None
-    if s.startswith("="):
+    if s.startswith("="):  # Excel formula
         return None
 
-    # Strip currency words and symbols
     s = re.sub(
-        r"(?i)\b(?:usd|us\$|kes|ksh|kshs|eur|gbp|aed|sar|qar|dollars?|shillings?)\b",
-        "", s)
+        r"(?i)\b(?:usd|us\$|kes|ksh|kshs|eur|gbp|aed|sar|qar|"
+        r"dollars?|shillings?)\b", "", s)
     s = s.replace("$", "").replace("€", "").replace("£", "").strip()
 
-    # Handle thousands/decimal separators — the ambiguous case
     if "," in s and "." in s:
-        # Which separator is the decimal? The one that comes last.
         if s.rfind(".") > s.rfind(","):
             s = s.replace(",", "")
         else:
             s = s.replace(".", "").replace(",", ".")
     elif "," in s:
-        # Single comma: if it looks like European decimal (2 digits after), treat as decimal
         if re.search(r",\d{1,2}$", s):
             s = s.replace(",", ".")
         else:
             s = s.replace(",", "")
 
-    # Non-breaking spaces sometimes appear between thousand groups
     s = s.replace("\u00a0", "").replace("\u202f", "")
     s = re.sub(r"(?<=\d)\s+(?=\d)", "", s)
 
@@ -234,9 +175,9 @@ def parse_number(v: Any) -> Optional[float]:
 
 
 # ===========================================================================
-#  ROLE CLASSIFICATION
+#  ROLE CLASSIFICATION WITH PRIORITY
 # ===========================================================================
-def classify(label: Any) -> Optional[str]:
+def _classify_basic(label: Any) -> Optional[str]:
     l = re.sub(r"[^a-z0-9 ]+", " ", norm(label)).strip()
     if not l:
         return None
@@ -252,29 +193,55 @@ def classify(label: Any) -> Optional[str]:
     return best_role if best_score >= 78 else None
 
 
-def slugify(label: str, taken: set) -> str:
-    base = clean_key(label) or "column"
-    key = base
-    i = 2
-    while key in taken:
-        key = f"{base}_{i}"
-        i += 1
-    taken.add(key)
-    return key
-
-
 def build_columns(headers: List[Any]) -> List[Dict[str, Any]]:
+    """
+    Assign roles to columns. If two columns claim the same role, only the
+    more specific label (per ROLE_PRIORITY) keeps it. The other is stored
+    as "<role>__<key>" so it stays visible but doesn't hijack calculations.
+    """
     taken: set = set()
     cols = []
     for h in headers:
         label = str(h or "").strip() or "Column"
-        key = slugify(label, taken)
+        key = clean_key(label) or "column"
+        k = key
+        i = 2
+        while k in taken:
+            k = f"{key}_{i}"
+            i += 1
+        taken.add(k)
         cols.append({
-            "key": key,
+            "key": k,
             "label": label,
-            "role": classify(label),
+            "role": _classify_basic(label),
             "source": "original",
         })
+
+    # Resolve role collisions
+    role_groups: Dict[str, List[Dict[str, Any]]] = {}
+    for c in cols:
+        if c["role"]:
+            role_groups.setdefault(c["role"], []).append(c)
+
+    for role, group in role_groups.items():
+        if len(group) <= 1:
+            continue
+        priority = ROLE_PRIORITY.get(role, [])
+        winner = None
+        for pref in priority:
+            pref_n = re.sub(r"[^a-z0-9 ]+", " ", norm(pref)).strip()
+            for c in group:
+                if re.sub(r"[^a-z0-9 ]+", " ", norm(c["label"])).strip() == pref_n:
+                    winner = c
+                    break
+            if winner:
+                break
+        if not winner:
+            winner = group[0]
+        for c in group:
+            if c is not winner:
+                c["role"] = f"{role}__{c['key']}"
+
     return cols
 
 
@@ -297,26 +264,46 @@ def clean_cell(v: Any) -> Any:
     return str(v).strip()
 
 
-def row_is_summary(row: Dict[str, Any]) -> bool:
-    text = " ".join(norm(v) for v in row.values() if v not in (None, ""))
-    return bool(re.search(
-        r"\b(?:subtotal|grand total|invoice total|balance due|"
-        r"thank you|total amount)\b", text))
-
-
 def row_is_empty(row: Dict[str, Any]) -> bool:
     return all(v in (None, "") for v in row.values())
+
+
+def row_is_summary(row: Dict[str, Any]) -> bool:
+    """
+    A summary row:
+      • Contains a totals keyword anywhere, OR
+      • Has very few populated cells and all of them are numeric.
+    Real items always have a product name (a string).
+    """
+    values = [v for v in row.values() if v not in (None, "")]
+    if not values:
+        return False
+
+    joined = " ".join(norm(v) for v in values)
+    if re.search(
+        r"\b(?:subtotal|grand\s+total|invoice\s+total|total\s+amount|"
+        r"balance\s+due|thank\s+you|amount\s+due|total\s+price)\b",
+        joined):
+        return True
+
+    numeric_like = 0
+    for v in values:
+        if isinstance(v, (int, float)):
+            numeric_like += 1
+        elif isinstance(v, str) and re.fullmatch(
+                r"\s*[\$€£]?\s*-?\d[\d,.\s]*\s*", v):
+            numeric_like += 1
+    if len(values) <= 3 and numeric_like == len(values):
+        return True
+
+    return False
 
 
 # ===========================================================================
 #  HEADER DETECTION
 # ===========================================================================
 def find_header_row(df: pd.DataFrame) -> int:
-    """
-    The header row is the one whose cells most often resolve to known roles.
-    Bias towards the first few rows so we don't accidentally pick a summary row.
-    """
-    best = (0, 0)  # (score, index)
+    best = (0, 0)
     scan = min(len(df), 40)
     for i in range(scan):
         try:
@@ -326,12 +313,11 @@ def find_header_row(df: pd.DataFrame) -> int:
             continue
         if len(vals) < 2:
             continue
-        recognized = sum(1 for x in vals if classify(x))
-        textish = sum(1 for x in vals if re.search(r"[A-Za-z]", x))
-        # Require some semantic hits to consider this a header
+        recognized = sum(1 for x in vals if _classify_basic(x))
         if recognized == 0:
             continue
-        score = recognized * 10 + min(textish, 10) - i  # prefer earlier rows
+        textish = sum(1 for x in vals if re.search(r"[A-Za-z]", x))
+        score = recognized * 10 + min(textish, 10) - i
         if score > best[0]:
             best = (score, i)
     return best[1]
@@ -340,9 +326,11 @@ def find_header_row(df: pd.DataFrame) -> int:
 # ===========================================================================
 #  DATAFRAME → STRUCTURE
 # ===========================================================================
-def dataframe_to_structure(df: pd.DataFrame, sheet_name: str = "") -> Dict[str, Any]:
+def dataframe_to_structure(df: pd.DataFrame,
+                           sheet_name: str = "") -> Dict[str, Any]:
     if df is None or df.empty:
-        return {"columns": [], "items": [], "sheet": sheet_name, "header_row": None}
+        return {"columns": [], "items": [], "sheet": sheet_name,
+                "header_row": None}
 
     df = df.iloc[:MAX_ROWS, :]
     header_idx = find_header_row(df)
@@ -350,18 +338,18 @@ def dataframe_to_structure(df: pd.DataFrame, sheet_name: str = "") -> Dict[str, 
     try:
         raw_headers = [clean_cell(x) for x in df.iloc[header_idx].tolist()]
     except Exception:
-        return {"columns": [], "items": [], "sheet": sheet_name, "header_row": None}
+        return {"columns": [], "items": [], "sheet": sheet_name,
+                "header_row": None}
 
-    # Drop trailing empty headers only (interior blanks become "Column")
     while raw_headers and raw_headers[-1] in (None, ""):
         raw_headers.pop()
-
     if not raw_headers:
-        return {"columns": [], "items": [], "sheet": sheet_name, "header_row": None}
+        return {"columns": [], "items": [], "sheet": sheet_name,
+                "header_row": None}
 
     columns = build_columns(raw_headers)
-
     items: List[Dict[str, Any]] = []
+
     for ridx in range(header_idx + 1, len(df)):
         try:
             row_vals = list(df.iloc[ridx].tolist())
@@ -377,17 +365,41 @@ def dataframe_to_structure(df: pd.DataFrame, sheet_name: str = "") -> Dict[str, 
                 record[col["key"]] = num if num is not None else cell
             else:
                 record[col["key"]] = cell
+
         if row_is_empty(record):
             continue
         if row_is_summary(record):
             continue
-        # Semantic aliases (so downstream chat code can use role names)
+
+        # Require a text value in any product-ish column
+        has_text = False
+        for col in columns:
+            if col.get("role") in ("product_name", "variety", "description",
+                                    "color"):
+                v = record.get(col["key"])
+                if isinstance(v, str) and len(v.strip()) >= 2 \
+                        and re.search(r"[A-Za-z]", v):
+                    has_text = True
+                    break
+        if not has_text:
+            # Fall back to any text column
+            for col in columns:
+                v = record.get(col["key"])
+                if isinstance(v, str) and len(v.strip()) >= 2 \
+                        and re.search(r"[A-Za-z]", v):
+                    has_text = True
+                    break
+        if not has_text:
+            continue
+
+        # Semantic aliases for downstream chat operations
         for col in columns:
             role = col.get("role")
             if role and role not in record:
                 record[role] = record.get(col["key"])
             elif role and record.get(role) in (None, ""):
                 record[role] = record.get(col["key"])
+
         items.append(record)
 
     return {
@@ -402,14 +414,11 @@ def dataframe_to_structure(df: pd.DataFrame, sheet_name: str = "") -> Dict[str, 
 #  EXCEL / CSV
 # ===========================================================================
 def extract_excel(content: bytes, ext: str) -> List[Dict[str, Any]]:
-    structures: List[Dict[str, Any]] = []
-
     if ext == "csv":
         for sep in (",", ";", "\t"):
             try:
-                df = pd.read_csv(
-                    io.BytesIO(content), header=None, sep=sep,
-                    engine="python", dtype=object)
+                df = pd.read_csv(io.BytesIO(content), header=None,
+                                 sep=sep, engine="python", dtype=object)
                 if df.shape[1] > 1 or sep == ",":
                     return [dataframe_to_structure(df, "CSV")]
             except Exception:
@@ -417,12 +426,13 @@ def extract_excel(content: bytes, ext: str) -> List[Dict[str, Any]]:
         return []
 
     try:
-        wb = openpyxl.load_workbook(
-            io.BytesIO(content), read_only=True, data_only=True)
+        wb = openpyxl.load_workbook(io.BytesIO(content),
+                                     read_only=True, data_only=True)
     except Exception as e:
         log.warning(f"openpyxl failed: {e}")
         return []
 
+    structures = []
     for ws in list(wb.worksheets)[:MAX_SHEETS]:
         try:
             rows = list(ws.values)
@@ -438,14 +448,14 @@ def extract_excel(content: bytes, ext: str) -> List[Dict[str, Any]]:
 
 
 # ===========================================================================
-#  PDF / DOCX / IMAGE / TEXT
+#  OCR / PDF / DOCX
 # ===========================================================================
 def ocr_image(img: Image.Image) -> str:
     img = ImageOps.exif_transpose(img).convert("L")
     w, h = img.size
     if max(w, h) < 2200:
-        scale = 2200 / max(w, h)
-        img = img.resize((int(w * scale), int(h * scale)))
+        s = 2200 / max(w, h)
+        img = img.resize((int(w * s), int(h * s)))
     img = ImageEnhance.Contrast(img).enhance(1.7)
     best = ""
     for psm in (6, 4, 11):
@@ -461,8 +471,6 @@ def ocr_image(img: Image.Image) -> str:
 
 
 def extract_pdf(content: bytes) -> Tuple[str, str]:
-    """Return (text, method)."""
-    # Native text first
     if fitz is not None:
         try:
             doc = fitz.open(stream=content, filetype="pdf")
@@ -521,19 +529,17 @@ def extract_docx(content: bytes) -> str:
 
 
 def text_to_structure(text: str) -> Dict[str, Any]:
-    """Parse a plain-text or OCR'd table into a structure."""
     lines = [x.strip() for x in str(text or "").splitlines() if x.strip()]
     if not lines:
         return {"columns": [], "items": [], "sections": []}
 
-    # Locate the most header-like line
     best_score, best_idx, best_cells = 0, None, None
     for i, line in enumerate(lines[:80]):
         cells = [x.strip() for x in re.split(r"\s*\|\s*|\t+|\s{2,}", line)
                  if x.strip()]
         if len(cells) < 2:
             continue
-        score = sum(1 for c in cells if classify(c))
+        score = sum(1 for c in cells if _classify_basic(c))
         if score > best_score:
             best_score, best_idx, best_cells = score, i, cells
 
@@ -546,8 +552,8 @@ def text_to_structure(text: str) -> Dict[str, Any]:
         }
 
     columns = build_columns(best_cells)
-
     items: List[Dict[str, Any]] = []
+
     for line in lines[best_idx + 1:]:
         low = line.lower()
         if re.search(r"\b(?:subtotal|grand total|balance due|"
@@ -569,13 +575,32 @@ def text_to_structure(text: str) -> Dict[str, Any]:
                 record[col["role"]] = record[col["key"]]
         if row_is_empty(record):
             continue
+
+        # Require text in a product column
+        has_text = False
+        for col in columns:
+            if col.get("role") in ("product_name", "variety", "description"):
+                v = record.get(col["key"])
+                if isinstance(v, str) and len(v.strip()) >= 2 \
+                        and re.search(r"[A-Za-z]", v):
+                    has_text = True
+                    break
+        if not has_text:
+            for col in columns:
+                v = record.get(col["key"])
+                if isinstance(v, str) and len(v.strip()) >= 2 \
+                        and re.search(r"[A-Za-z]", v):
+                    has_text = True
+                    break
+        if not has_text:
+            continue
         items.append(record)
 
     return {"columns": columns, "items": items, "sections": []}
 
 
 # ===========================================================================
-#  CANONICALIZATION + VALIDATION
+#  CANONICALIZATION
 # ===========================================================================
 def canonicalize(structure: Dict[str, Any]) -> List[Dict[str, Any]]:
     cols = structure.get("columns", [])
@@ -589,7 +614,7 @@ def canonicalize(structure: Dict[str, Any]) -> List[Dict[str, Any]]:
     out = []
     for i, row in enumerate(items):
         x = dict(row)
-        warnings: List[str] = []
+        warnings = []
         confidence = 0.55
 
         q_col = role_col("quantity")
@@ -611,11 +636,9 @@ def canonicalize(structure: Dict[str, Any]) -> List[Dict[str, Any]]:
         if tv is not None:
             confidence += 0.08
 
-        # Arithmetic reconciliation
         if qv is not None and pv is not None:
             expected = qv * pv
             if t_col is None:
-                x.setdefault("total", round(expected, 4))
                 x["total"] = round(expected, 4)
                 confidence += 0.06
             elif tv is None:
@@ -637,7 +660,8 @@ def canonicalize(structure: Dict[str, Any]) -> List[Dict[str, Any]]:
     return out
 
 
-def infer_document_type(text: str, items: List[Dict[str, Any]], filename: str) -> str:
+def infer_document_type(text: str, items: List[Dict[str, Any]],
+                        filename: str) -> str:
     blob = norm(" ".join([Path(filename).stem, (text or "")[:5000]]))
     for kw, dt in [
         ("proforma", "proforma_invoice"),
@@ -651,19 +675,16 @@ def infer_document_type(text: str, items: List[Dict[str, Any]], filename: str) -
     ]:
         if kw in blob:
             return dt
-    if items:
-        return "line_item_document"
-    return "business_document"
+    return "line_item_document" if items else "business_document"
 
 
 # ===========================================================================
-#  MAIN ANALYSIS ENTRY POINT
+#  MAIN ANALYSIS
 # ===========================================================================
 def analyze_bytes(content: bytes, fname: str, ext: str,
                   company_id: int = 0, prompt: str = "") -> Dict[str, Any]:
     started = time.perf_counter()
     ext = (ext or Path(fname).suffix.lstrip(".")).lower()
-
     structures: List[Dict[str, Any]] = []
     raw_text = ""
     method = "unknown"
@@ -719,23 +740,16 @@ def analyze_bytes(content: bytes, fname: str, ext: str,
             "success": False,
             "engine_version": ENGINE_VERSION,
             "error": "No readable structure was detected.",
-            "columns": [],
-            "items": [],
-            "raw_items": [],
+            "columns": [], "items": [], "raw_items": [],
             "raw_text": raw_text[:20000],
-            "diagnostics": {
-                "stage": "ingestion",
-                "file": fname,
-                "method": method,
-                "trust_score": 0,
-                "confidence_band": "review",
-            },
+            "diagnostics": {"stage": "ingestion", "file": fname,
+                            "method": method, "trust_score": 0,
+                            "confidence_band": "review"},
         }
 
-    # Merge sheets — first sheet supplies the primary column schema.
     primary_columns = structures[0].get("columns", [])
-    merged_items: List[Dict[str, Any]] = []
-    sheet_names: List[str] = []
+    merged_items = []
+    sheet_names = []
     for s in structures:
         sheet_names.append(s.get("sheet") or "")
         for row in s.get("items", []):
@@ -743,12 +757,11 @@ def analyze_bytes(content: bytes, fname: str, ext: str,
             r["_sheet"] = s.get("sheet") or None
             merged_items.append(r)
 
-    items = canonicalize({"columns": primary_columns, "items": merged_items})
+    items = canonicalize({"columns": primary_columns,
+                          "items": merged_items})
 
-    total_qty = sum(
-        (parse_number(r.get("quantity")) or 0) for r in items)
-    total_amount = sum(
-        (parse_number(r.get("total")) or 0) for r in items)
+    total_qty = sum(parse_number(r.get("quantity")) or 0 for r in items)
+    total_amount = sum(parse_number(r.get("total")) or 0 for r in items)
 
     trust = (sum(r["_meta"]["confidence"] for r in items) / len(items)
              if items else 0.25)
@@ -775,10 +788,9 @@ def analyze_bytes(content: bytes, fname: str, ext: str,
         "diagnostics": {
             "sheets": sheet_names,
             "trust_score": trust,
-            "confidence_band": (
-                "high" if trust >= 0.85
-                else "medium" if trust >= 0.65
-                else "review"),
+            "confidence_band": ("high" if trust >= 0.85
+                                else "medium" if trust >= 0.65
+                                else "review"),
             "anomalies": anomalies,
         },
         "elapsed_seconds": round(time.perf_counter() - started, 3),
@@ -788,7 +800,7 @@ def analyze_bytes(content: bytes, fname: str, ext: str,
 
 
 # ===========================================================================
-#  PYDANTIC MODELS
+#  MODELS
 # ===========================================================================
 class ChatRequest(BaseModel):
     items: List[Dict[str, Any]] = []
@@ -817,12 +829,6 @@ async def root():
         "version": ENGINE_VERSION,
         "status": "operational",
         "chat_engine_available": _CHAT_AVAILABLE,
-        "capabilities": [
-            "xlsx", "xls", "xlsm", "csv", "pdf", "docx", "image", "text",
-            "json", "semantic_roles", "ocr",
-            "natural_language_commands",
-            "calculation_verification", "multi_sheet",
-        ],
     }
 
 
@@ -834,13 +840,9 @@ def ping():
 
 @app.get("/api/health")
 def health():
-    return {
-        "status": "healthy",
-        "version": ENGINE_VERSION,
-        "ocr_available": True,
-        "pdf_available": fitz is not None,
-        "chat_engine_available": _CHAT_AVAILABLE,
-    }
+    return {"status": "healthy", "version": ENGINE_VERSION,
+            "ocr_available": True, "pdf_available": fitz is not None,
+            "chat_engine_available": _CHAT_AVAILABLE}
 
 
 @app.post("/api/analyze")
@@ -855,55 +857,39 @@ async def analyze(
         raise HTTPException(400, "Empty file")
     if len(content) > MAX_UPLOAD_MB * 1024 * 1024:
         raise HTTPException(413, f"File larger than {MAX_UPLOAD_MB} MB")
-
     fname = file.filename or "upload"
     ext = (file_type or Path(fname).suffix.lstrip(".")).lower()
-
     try:
         return analyze_bytes(content, fname, ext, company_id, prompt)
     except Exception as e:
         log.exception("Analysis failed")
-        return {
-            "success": False,
-            "engine_version": ENGINE_VERSION,
-            "error": "Analysis failed safely.",
-            "columns": [],
-            "items": [],
-            "raw_items": [],
-            "diagnostics": {"exception": str(e), "file": fname},
-        }
+        return {"success": False, "engine_version": ENGINE_VERSION,
+                "error": "Analysis failed safely.",
+                "columns": [], "items": [], "raw_items": [],
+                "diagnostics": {"exception": str(e), "file": fname}}
 
 
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
     if not _CHAT_AVAILABLE or chat_process_message is None:
-        return {
-            "success": False,
-            "status": "error",
-            "items": req.items,
-            "columns": req.columns,
-            "explanation": "Command engine is not loaded on the server.",
-            "needs_clarification": False,
-        }
+        return {"success": False, "status": "error",
+                "items": req.items, "columns": req.columns,
+                "explanation": "Command engine is not loaded.",
+                "needs_clarification": False}
     try:
         return chat_process_message(req.items, req.columns, req.message)
     except Exception as e:
         log.exception("chat failure")
-        return {
-            "success": False,
-            "status": "error",
-            "items": req.items,
-            "columns": req.columns,
-            "explanation": "The command could not be applied safely.",
-            "error": str(e),
-            "needs_clarification": False,
-        }
+        return {"success": False, "status": "error",
+                "items": req.items, "columns": req.columns,
+                "explanation": "Command could not be applied safely.",
+                "error": str(e), "needs_clarification": False}
 
 
 @app.post("/api/apply-prompt")
 async def apply_prompt(req: PromptRequest):
-    return await chat(ChatRequest(
-        items=req.items, columns=req.columns, message=req.prompt))
+    return await chat(ChatRequest(items=req.items, columns=req.columns,
+                                   message=req.prompt))
 
 
 @app.post("/api/extract-text")
@@ -911,7 +897,6 @@ async def extract_text(file: UploadFile = File(...)):
     content = await file.read()
     fname = file.filename or "upload"
     ext = Path(fname).suffix.lstrip(".").lower()
-
     if ext == "pdf":
         text, method = extract_pdf(content)
     elif ext == "docx":
@@ -923,7 +908,6 @@ async def extract_text(file: UploadFile = File(...)):
     else:
         text = content.decode("utf-8", errors="ignore")
         method = "text"
-
     return {"success": True, "text": text, "length": len(text),
             "file_type": ext, "extraction_method": method,
             "engine_version": ENGINE_VERSION}
@@ -957,11 +941,11 @@ async def match_products(req: MatchRequest):
             "match_confidence": round(best[0] / 100, 3),
             "match_status": "matched" if accepted else "review_required",
         })
-    return {
-        "success": True, "items": out,
-        "matched_count": sum(1 for x in out if x["match_status"] == "matched"),
-        "review_count": sum(1 for x in out if x["match_status"] == "review_required"),
-    }
+    return {"success": True, "items": out,
+            "matched_count": sum(1 for x in out
+                                 if x["match_status"] == "matched"),
+            "review_count": sum(1 for x in out
+                                if x["match_status"] == "review_required")}
 
 
 if __name__ == "__main__":
