@@ -1,25 +1,40 @@
 """
 ALTECH SOFTWARE DEVELOPERS
-SMART DOCUMENT INTELLIGENCE ENGINE v22
+SMART DOCUMENT INTELLIGENCE ENGINE v24
 --------------------------------------
-Universal document ingestion with semantic role resolution.
+Universal document ingestion + web-assisted entity resolution.
 
-Fixes in v22:
-  • Role collision: "Qty" and "Stems" both map to quantity. Only the
-    more specific label wins the semantic alias. The other is kept under
-    "<role>__<key>" so it stays visible but doesn't hijack calculations.
-  • Stricter summary-row detection: rows where every populated cell is
-    numeric are excluded. Real items always have a product name.
-  • Summary keyword regex expanded for edge cases.
-  • Robust currency parsing for "$1.30", "USD 1,350.00", "1.234,56".
-  • Formula cells ("=PRODUCT(...)") preserved but not parsed as numbers.
+Endpoints:
+  GET  /                     service info
+  GET  /api/ping             liveness
+  GET  /api/health           full status
+  POST /api/analyze          extract items from a file
+  POST /api/chat             natural-language command execution
+  POST /api/apply-prompt     apply a prompt to already-extracted items
+  POST /api/lookup           free web lookup (DuckDuckGo instant answer)
+  POST /api/extract-text     raw text of a file
+  POST /api/match-products   fuzzy product matching
 
-Integrates ideas from IBM Docling and MinerU: multi-sheet awareness,
-lossless JSON output, per-row confidence and anomaly tracking.
+Design:
+  • Semantic role classification for every column
+  • Role-collision resolution (Qty vs Stems → correct quantity wins)
+  • Strict summary-row and empty-row filtering
+  • Robust currency parsing ($1.30, USD 1,350.00, 1.234,56)
+  • Web lookup only used when the chat engine asks for it
 """
 
 from __future__ import annotations
-import io, os, re, json, math, time, logging
+
+import io
+import os
+import re
+import json
+import math
+import time
+import logging
+import urllib.request
+import urllib.parse
+import urllib.error
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -37,7 +52,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 try:
-    import fitz
+    import fitz  # PyMuPDF
 except Exception:
     fitz = None
 
@@ -45,7 +60,8 @@ try:
     from chat_engine import process_message as chat_process_message
     _CHAT_AVAILABLE = True
 except Exception as _e:
-    logging.getLogger("altech-engine").warning(f"chat_engine not available: {_e}")
+    logging.getLogger("altech-engine").warning(
+        f"chat_engine not available: {_e}")
     chat_process_message = None
     _CHAT_AVAILABLE = False
 
@@ -53,12 +69,15 @@ except Exception as _e:
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("altech-smart-document")
 
-ENGINE_VERSION = "22.0.0"
+ENGINE_VERSION = "24.0.0"
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "40"))
 MAX_ROWS = int(os.getenv("MAX_ROWS", "20000"))
 MAX_SHEETS = int(os.getenv("MAX_SHEETS", "50"))
 MAX_OCR_PAGES = int(os.getenv("MAX_OCR_PAGES", "30"))
 OCR_DPI = int(os.getenv("OCR_DPI", "200"))
+WEB_LOOKUP_ENABLED = os.getenv("WEB_LOOKUP_ENABLED", "1") == "1"
+WEB_LOOKUP_TIMEOUT = int(os.getenv("WEB_LOOKUP_TIMEOUT", "6"))
+
 TESS_CMD = os.getenv("TESSERACT_CMD", "/usr/bin/tesseract")
 if os.path.exists(TESS_CMD):
     pytesseract.pytesseract.tesseract_cmd = TESS_CMD
@@ -74,43 +93,54 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
 #  ROLE MODEL
 # ===========================================================================
 ROLE_ALIASES = {
-    "product_name": ["product", "product name", "item", "item name",
-                     "flower", "flower name", "description", "item description",
-                     "particulars", "goods", "article", "articles",
-                     "flower variety", "variety", "cultivar"],
-    "variety": ["variety", "cultivar", "cultivar name"],
-    "quantity": ["quantity", "qty", "qnty", "stems", "total stems",
-                 "pieces", "pcs", "units", "count", "total quantity"],
+    "product_name": [
+        "product", "product name", "item", "item name", "flower",
+        "flower name", "description", "item description",
+        "particulars", "goods", "article", "articles",
+        "flower variety", "variety", "cultivar",
+    ],
+    "variety": ["variety", "cultivar"],
+    "quantity": [
+        "quantity", "qty", "qnty", "stems", "total stems", "pieces",
+        "pcs", "units", "count", "total quantity",
+    ],
     "boxes": ["boxes", "box", "bx", "cartons", "carton", "ctn", "cases"],
-    "pack_rate": ["packrate", "pack rate", "pack_rate", "per box",
-                  "per carton", "stems per box", "stems/box",
-                  "qty per box", "quantity per box"],
-    "unit_price": ["price", "unit price", "unit_price", "rate", "cost",
-                   "unit cost", "price per stem", "price/stem"],
-    "total": ["total", "amount", "line total", "line amount",
-              "total amount", "extended price", "revenue"],
-    "length_cm": ["length", "length cm", "length (cm)", "length(cm)",
-                  "stem length", "size", "size cm"],
+    "pack_rate": [
+        "packrate", "pack rate", "pack_rate", "per box", "per carton",
+        "stems per box", "stems/box", "qty per box", "quantity per box",
+    ],
+    "unit_price": [
+        "price", "unit price", "unit_price", "rate", "cost",
+        "unit cost", "price per stem", "price/stem",
+    ],
+    "total": [
+        "total", "amount", "line total", "line amount",
+        "total amount", "extended price", "revenue",
+    ],
+    "length_cm": [
+        "length", "length cm", "length (cm)", "length(cm)",
+        "stem length", "size",
+    ],
     "head_size_cm": ["head size", "head size cm", "head size (cm)"],
     "color": ["color", "colour", "shade"],
-    "farm_code": ["farm code", "farm", "farmcode", "grower code"],
+    "farm_code": ["farm code", "farm", "farmcode"],
     "invoice_number": ["invoice number", "invoice no", "invoice #",
-                       "invoice no.", "inv no", "reference"],
-    "date": ["date", "invoice date", "shipment date", "issue date"],
-    "due_date": ["due date", "payment due", "valid until", "expiry"],
-    "currency": ["currency", "currency code", "ccy"],
-    "vat_rate": ["vat", "vat rate", "vat %", "tax", "tax rate"],
-    "discount": ["discount", "disc.", "rebate"],
+                       "reference"],
+    "date": ["date", "invoice date", "shipment date"],
+    "due_date": ["due date", "payment due", "valid until"],
+    "currency": ["currency"],
+    "vat_rate": ["vat", "vat rate", "tax", "tax rate"],
+    "discount": ["discount"],
 }
 
-NUMERIC_ROLES = {"quantity", "boxes", "pack_rate", "length_cm",
-                 "head_size_cm", "unit_price", "total", "vat_rate",
-                 "discount"}
+NUMERIC_ROLES = {
+    "quantity", "boxes", "pack_rate", "length_cm", "head_size_cm",
+    "unit_price", "total", "vat_rate", "discount",
+}
 
-# More specific labels win when two columns classify into the same role.
 ROLE_PRIORITY = {
-    "quantity": ["total stems", "stems", "number of stems", "stem quantity",
-                 "total quantity", "quantity", "qty"],
+    "quantity": ["total stems", "number of stems", "stem quantity",
+                 "stems", "total quantity", "quantity", "qty"],
     "unit_price": ["unit price", "price per stem", "unit cost",
                    "rate", "price", "cost"],
     "total": ["line total", "total amount", "extended price",
@@ -131,7 +161,7 @@ def clean_key(s: str) -> str:
 
 
 # ===========================================================================
-#  NUMBER PARSING — handles $1.30, USD 1,350.00, 1.234,56
+#  NUMBER PARSING
 # ===========================================================================
 def parse_number(v: Any) -> Optional[float]:
     if v is None or isinstance(v, bool):
@@ -139,18 +169,15 @@ def parse_number(v: Any) -> Optional[float]:
     if isinstance(v, (int, float)):
         x = float(v)
         return x if math.isfinite(x) else None
-
     s = str(v).strip()
     if not s:
         return None
-    if s.startswith("="):  # Excel formula
+    if s.startswith("="):
         return None
-
     s = re.sub(
         r"(?i)\b(?:usd|us\$|kes|ksh|kshs|eur|gbp|aed|sar|qar|"
         r"dollars?|shillings?)\b", "", s)
     s = s.replace("$", "").replace("€", "").replace("£", "").strip()
-
     if "," in s and "." in s:
         if s.rfind(".") > s.rfind(","):
             s = s.replace(",", "")
@@ -161,10 +188,8 @@ def parse_number(v: Any) -> Optional[float]:
             s = s.replace(",", ".")
         else:
             s = s.replace(",", "")
-
     s = s.replace("\u00a0", "").replace("\u202f", "")
     s = re.sub(r"(?<=\d)\s+(?=\d)", "", s)
-
     m = re.search(r"-?\d+(?:\.\d+)?", s)
     if not m:
         return None
@@ -175,7 +200,7 @@ def parse_number(v: Any) -> Optional[float]:
 
 
 # ===========================================================================
-#  ROLE CLASSIFICATION WITH PRIORITY
+#  ROLE CLASSIFICATION
 # ===========================================================================
 def _classify_basic(label: Any) -> Optional[str]:
     l = re.sub(r"[^a-z0-9 ]+", " ", norm(label)).strip()
@@ -194,11 +219,6 @@ def _classify_basic(label: Any) -> Optional[str]:
 
 
 def build_columns(headers: List[Any]) -> List[Dict[str, Any]]:
-    """
-    Assign roles to columns. If two columns claim the same role, only the
-    more specific label (per ROLE_PRIORITY) keeps it. The other is stored
-    as "<role>__<key>" so it stays visible but doesn't hijack calculations.
-    """
     taken: set = set()
     cols = []
     for h in headers:
@@ -211,8 +231,7 @@ def build_columns(headers: List[Any]) -> List[Dict[str, Any]]:
             i += 1
         taken.add(k)
         cols.append({
-            "key": k,
-            "label": label,
+            "key": k, "label": label,
             "role": _classify_basic(label),
             "source": "original",
         })
@@ -231,7 +250,8 @@ def build_columns(headers: List[Any]) -> List[Dict[str, Any]]:
         for pref in priority:
             pref_n = re.sub(r"[^a-z0-9 ]+", " ", norm(pref)).strip()
             for c in group:
-                if re.sub(r"[^a-z0-9 ]+", " ", norm(c["label"])).strip() == pref_n:
+                if re.sub(r"[^a-z0-9 ]+", " ",
+                          norm(c["label"])).strip() == pref_n:
                     winner = c
                     break
             if winner:
@@ -269,23 +289,15 @@ def row_is_empty(row: Dict[str, Any]) -> bool:
 
 
 def row_is_summary(row: Dict[str, Any]) -> bool:
-    """
-    A summary row:
-      • Contains a totals keyword anywhere, OR
-      • Has very few populated cells and all of them are numeric.
-    Real items always have a product name (a string).
-    """
     values = [v for v in row.values() if v not in (None, "")]
     if not values:
         return False
-
     joined = " ".join(norm(v) for v in values)
     if re.search(
         r"\b(?:subtotal|grand\s+total|invoice\s+total|total\s+amount|"
         r"balance\s+due|thank\s+you|amount\s+due|total\s+price)\b",
         joined):
         return True
-
     numeric_like = 0
     for v in values:
         if isinstance(v, (int, float)):
@@ -295,7 +307,6 @@ def row_is_summary(row: Dict[str, Any]) -> bool:
             numeric_like += 1
     if len(values) <= 3 and numeric_like == len(values):
         return True
-
     return False
 
 
@@ -371,7 +382,6 @@ def dataframe_to_structure(df: pd.DataFrame,
         if row_is_summary(record):
             continue
 
-        # Require a text value in any product-ish column
         has_text = False
         for col in columns:
             if col.get("role") in ("product_name", "variety", "description",
@@ -382,7 +392,6 @@ def dataframe_to_structure(df: pd.DataFrame,
                     has_text = True
                     break
         if not has_text:
-            # Fall back to any text column
             for col in columns:
                 v = record.get(col["key"])
                 if isinstance(v, str) and len(v.strip()) >= 2 \
@@ -392,7 +401,6 @@ def dataframe_to_structure(df: pd.DataFrame,
         if not has_text:
             continue
 
-        # Semantic aliases for downstream chat operations
         for col in columns:
             role = col.get("role")
             if role and role not in record:
@@ -576,7 +584,6 @@ def text_to_structure(text: str) -> Dict[str, Any]:
         if row_is_empty(record):
             continue
 
-        # Require text in a product column
         has_text = False
         for col in columns:
             if col.get("role") in ("product_name", "variety", "description"):
@@ -800,12 +807,41 @@ def analyze_bytes(content: bytes, fname: str, ext: str,
 
 
 # ===========================================================================
+#  WEB LOOKUP (free, DuckDuckGo instant answer)
+# ===========================================================================
+def web_lookup(query: str) -> Dict[str, Any]:
+    if not WEB_LOOKUP_ENABLED or not query:
+        return {"ok": False, "reason": "disabled or empty"}
+    try:
+        url = ("https://api.duckduckgo.com/?q="
+               + urllib.parse.quote(query)
+               + "&format=json&no_html=1&skip_disambig=1")
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "AltechSmartDocs/24.0"})
+        with urllib.request.urlopen(req, timeout=WEB_LOOKUP_TIMEOUT) as r:
+            data = json.loads(r.read().decode("utf-8", errors="ignore"))
+        for key in ("AbstractText", "Answer", "Definition"):
+            v = data.get(key)
+            if v and isinstance(v, str) and len(v.strip()) > 4:
+                return {"ok": True, "answer": v.strip()[:600],
+                        "source": "duckduckgo"}
+        for topic in data.get("RelatedTopics") or []:
+            if isinstance(topic, dict) and topic.get("Text"):
+                return {"ok": True, "answer": topic["Text"].strip()[:600],
+                        "source": "duckduckgo"}
+    except Exception as e:
+        return {"ok": False, "reason": str(e)}
+    return {"ok": False, "reason": "no answer found"}
+
+
+# ===========================================================================
 #  MODELS
 # ===========================================================================
 class ChatRequest(BaseModel):
     items: List[Dict[str, Any]] = []
     columns: List[Dict[str, Any]] = []
     message: str = ""
+    history: List[Any] = []
 
 
 class PromptRequest(BaseModel):
@@ -819,6 +855,10 @@ class MatchRequest(BaseModel):
     company_products: List[Dict[str, Any]] = []
 
 
+class LookupRequest(BaseModel):
+    query: str = ""
+
+
 # ===========================================================================
 #  ENDPOINTS
 # ===========================================================================
@@ -829,20 +869,23 @@ async def root():
         "version": ENGINE_VERSION,
         "status": "operational",
         "chat_engine_available": _CHAT_AVAILABLE,
+        "web_lookup_available": WEB_LOOKUP_ENABLED,
     }
 
 
 @app.get("/api/ping")
 def ping():
     return {"ok": True, "version": ENGINE_VERSION,
-            "chat_engine_available": _CHAT_AVAILABLE}
+            "chat_engine_available": _CHAT_AVAILABLE,
+            "web_lookup_available": WEB_LOOKUP_ENABLED}
 
 
 @app.get("/api/health")
 def health():
     return {"status": "healthy", "version": ENGINE_VERSION,
             "ocr_available": True, "pdf_available": fitz is not None,
-            "chat_engine_available": _CHAT_AVAILABLE}
+            "chat_engine_available": _CHAT_AVAILABLE,
+            "web_lookup_available": WEB_LOOKUP_ENABLED}
 
 
 @app.post("/api/analyze")
@@ -877,7 +920,12 @@ async def chat(req: ChatRequest):
                 "explanation": "Command engine is not loaded.",
                 "needs_clarification": False}
     try:
-        return chat_process_message(req.items, req.columns, req.message)
+        try:
+            return chat_process_message(req.items, req.columns,
+                                        req.message, req.history)
+        except TypeError:
+            return chat_process_message(req.items, req.columns,
+                                        req.message)
     except Exception as e:
         log.exception("chat failure")
         return {"success": False, "status": "error",
@@ -890,6 +938,12 @@ async def chat(req: ChatRequest):
 async def apply_prompt(req: PromptRequest):
     return await chat(ChatRequest(items=req.items, columns=req.columns,
                                    message=req.prompt))
+
+
+@app.post("/api/lookup")
+async def lookup(req: LookupRequest):
+    """Free web lookup for entity resolution."""
+    return web_lookup((req.query or "").strip())
 
 
 @app.post("/api/extract-text")
