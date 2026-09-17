@@ -16,22 +16,13 @@ NEW IN v27 (vs v26):
 
 CARRIED FORWARD FROM v26:
   • _parse_price_command rewritten so the TARGET comes from before the
-    price verb, not from "the last noun". Handles:
-      "add unit price 0.5 to all Hydrangea"
-      "TO ALL HYDRANGEA ADD UNIT PRICE 0.5"
-      "set price 0.5 for all Hydrangea"
-      "Hydrangea unit price 0.5"
-  • Multi-line input joined with "; " so "TO ALL HYDRANGEA ONLY\n
-    ADD UNIT PRICE 0.5" becomes one command.
+    price verb, not from "the last noun".
+  • Multi-line input joined so multi-line commands become one command.
   • Read-cell queries:
       "what colour is Hydrangea scarlet"
       "what is the price of Carnation Everest"
       "show me the variety of Hydrangea bianca"
-  • Smart column-naming for "ADD LINE TOTAL COLUMN":
-      "add line total column"  → computes quantity × unit_price into
-                                  "Line Total"
-      "add unit price column"  → creates empty "Unit Price"
-      "add X column"           → creates empty X
+  • Smart column-naming for "ADD LINE TOTAL COLUMN".
 """
 
 from __future__ import annotations
@@ -1059,7 +1050,7 @@ def _add_row(items, columns, msg):
 
 
 # ===========================================================================
-#  COLUMN CREATION — smart naming
+#  COLUMN CREATION
 # ===========================================================================
 COLUMN_NOUN_ALIASES = {
     "line total": "Line Total",
@@ -1496,7 +1487,7 @@ def _split_commands(msg: str) -> List[str]:
 
 
 # ===========================================================================
-#  AI PLANNER (fallback only — untouched)
+#  AI PLANNER (fallback only)
 # ===========================================================================
 def _ai_plan(message, items, columns, history=None):
     provider = os.getenv("AI_PROVIDER", "auto").lower()
