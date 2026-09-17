@@ -1,19 +1,19 @@
 """
 ALTECH SOFTWARE DEVELOPERS
-SMART DOCUMENT INTELLIGENCE ENGINE v26
+SMART DOCUMENT INTELLIGENCE ENGINE v27
 --------------------------------------
-Universal document ingestion via a unified document_engine package.
-Unstructured is used as an optional helper for complex files across
-ALL supported types (Excel, CSV, DOCX, PDF, images, text).
+Universal document ingestion.
+Routes complex files through document_engine (Unstructured-aware)
+and keeps the proven native path as a safety fallback.
 
-Endpoints (unchanged from v25):
+Endpoints:
   GET  /                     service info
   GET  /api/ping             liveness
   GET  /api/health           full status
   POST /api/analyze          extract items from a file
   POST /api/chat             natural-language command execution
   POST /api/apply-prompt     apply a prompt to already-extracted items
-  POST /api/lookup           free web lookup
+  POST /api/lookup           free web lookup (DuckDuckGo instant answer)
   POST /api/extract-text     raw text of a file
   POST /api/match-products   fuzzy product matching
 """
@@ -60,9 +60,6 @@ except Exception as _e:
     chat_process_message = None
     _CHAT_AVAILABLE = False
 
-# ---------------------------------------------------------------------------
-# NEW: Unified document engine (Unstructured-aware, universal file support)
-# ---------------------------------------------------------------------------
 try:
     from document_engine.pipeline import analyze_document
     _DOC_ENGINE_AVAILABLE = True
@@ -76,7 +73,7 @@ except Exception as _e:
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("altech-smart-document")
 
-ENGINE_VERSION = "26.0.0"
+ENGINE_VERSION = "27.0.0"
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "40"))
 MAX_ROWS = int(os.getenv("MAX_ROWS", "20000"))
 MAX_SHEETS = int(os.getenv("MAX_SHEETS", "50"))
@@ -244,6 +241,7 @@ def build_columns(headers: List[Any]) -> List[Dict[str, Any]]:
             "source": "original",
         })
 
+    # Resolve role collisions
     role_groups: Dict[str, List[Dict[str, Any]]] = {}
     for c in cols:
         if c["role"]:
@@ -463,7 +461,7 @@ def extract_excel(content: bytes, ext: str) -> List[Dict[str, Any]]:
 
 
 # ===========================================================================
-#  OCR
+#  OCR / PDF / DOCX
 # ===========================================================================
 def ocr_image(img: Image.Image) -> str:
     img = ImageOps.exif_transpose(img).convert("L")
@@ -485,63 +483,35 @@ def ocr_image(img: Image.Image) -> str:
     return best
 
 
-# ===========================================================================
-#  PDF EXTRACTION — layout-aware
-# ===========================================================================
 def extract_pdf(content: bytes) -> Tuple[str, str]:
-    if fitz is None:
+    if fitz is not None:
         try:
-            reader = PyPDF2.PdfReader(io.BytesIO(content))
-            text = "\n".join(p.extract_text() or "" for p in reader.pages)
+            doc = fitz.open(stream=content, filetype="pdf")
+            chunks = []
+            for p in doc:
+                t = p.get_text("text", sort=True) or ""
+                if t.strip():
+                    chunks.append(t)
+            doc.close()
+            text = "\n".join(chunks)
+            if len(re.sub(r"\s+", "", text)) >= 30:
+                return text, "pdf_text"
+        except Exception as e:
+            log.warning(f"fitz failed: {e}")
+
+    try:
+        reader = PyPDF2.PdfReader(io.BytesIO(content))
+        text = "\n".join(p.extract_text() or "" for p in reader.pages)
+        if len(re.sub(r"\s+", "", text)) >= 30:
             return text, "pdf_text_pypdf2"
-        except Exception:
-            return "", "pdf_no_reader"
+    except Exception:
+        pass
+
+    if fitz is None:
+        return "", "pdf_no_reader"
 
     try:
         doc = fitz.open(stream=content, filetype="pdf")
-    except Exception:
-        return "", "pdf_open_failed"
-
-    pages: List[Dict[str, Any]] = []
-    for page_no, page in enumerate(doc):
-        try:
-            plain = page.get_text("text", sort=True) or ""
-        except Exception:
-            plain = ""
-
-        blocks: List[Dict[str, Any]] = []
-        try:
-            for b in page.get_text("blocks", sort=True) or []:
-                x0, y0, x1, y1 = b[0], b[1], b[2], b[3]
-                text = (b[4] or "").strip()
-                if text:
-                    blocks.append({
-                        "x0": float(x0), "y0": float(y0),
-                        "x1": float(x1), "y1": float(y1),
-                        "text": text,
-                    })
-        except Exception:
-            pass
-
-        pages.append({
-            "page_no": page_no,
-            "text": plain,
-            "blocks": blocks,
-            "char_count": len(re.sub(r"\s+", "", plain)),
-        })
-
-    if not pages:
-        return "", "pdf_empty"
-
-    merged = _merge_pdf_pages(pages)
-    if merged:
-        return merged, "pdf_merged"
-
-    combined = "\n".join(p["text"] for p in pages if p["text"])
-    if len(re.sub(r"\s+", "", combined)) >= 30:
-        return combined, "pdf_text"
-
-    try:
         parts = []
         for i, p in enumerate(doc):
             if i >= MAX_OCR_PAGES:
@@ -551,107 +521,9 @@ def extract_pdf(content: bytes) -> Tuple[str, str]:
             parts.append(ocr_image(img))
         return "\n".join(parts), "pdf_ocr"
     except Exception:
-        return combined, "pdf_text_partial"
+        return "", "pdf_ocr_failed"
 
 
-def _blocks_to_rows(blocks: List[Dict[str, Any]],
-                    y_tol: float = 4.0) -> List[List[Dict[str, Any]]]:
-    if not blocks:
-        return []
-    sorted_blocks = sorted(blocks, key=lambda b: (b["y0"], b["x0"]))
-    rows: List[List[Dict[str, Any]]] = []
-    current: List[Dict[str, Any]] = [sorted_blocks[0]]
-    current_y = sorted_blocks[0]["y0"]
-    for b in sorted_blocks[1:]:
-        if abs(b["y0"] - current_y) <= y_tol:
-            current.append(b)
-        else:
-            rows.append(sorted(current, key=lambda x: x["x0"]))
-            current = [b]
-            current_y = b["y0"]
-    if current:
-        rows.append(sorted(current, key=lambda x: x["x0"]))
-    return rows
-
-
-def _count_columns(blocks: List[Dict[str, Any]]) -> int:
-    buckets = set()
-    for b in blocks:
-        cx = (b["x0"] + b["x1"]) / 2
-        buckets.add(int(cx // 25))
-    return len(buckets)
-
-
-def _merge_pdf_pages(pages: List[Dict[str, Any]]) -> str:
-    if not pages:
-        return ""
-
-    for p in pages:
-        p["column_count"] = _count_columns(p["blocks"])
-        p["rows"] = _blocks_to_rows(p["blocks"])
-
-    master = max(pages, key=lambda p: p["column_count"])
-    if master["column_count"] < 3:
-        return ""
-
-    indexed: Dict[int, List[str]] = {}
-    orphans: List[List[str]] = []
-
-    for p in sorted(pages, key=lambda p: p["page_no"]):
-        for row_blocks in p["rows"]:
-            cells = [b["text"] for b in row_blocks]
-            if not cells:
-                continue
-            joined = " ".join(cells)
-            if len(cells) == 1 and not re.search(r"[A-Za-z0-9]", joined):
-                continue
-
-            idx = None
-            for j, c in enumerate(cells):
-                n = parse_number(c)
-                if n is not None and float(n).is_integer() \
-                        and 1 <= n <= 99999:
-                    idx = int(n)
-                    cells_no_idx = cells[:j] + cells[j+1:]
-                    break
-            else:
-                cells_no_idx = cells
-
-            if idx is None:
-                orphans.append(cells_no_idx)
-                continue
-
-            if idx in indexed:
-                existing = indexed[idx]
-                for c in cells_no_idx:
-                    if c and c not in existing:
-                        existing.append(c)
-            else:
-                indexed[idx] = list(cells_no_idx)
-
-    if not indexed and not orphans:
-        return ""
-
-    out_lines: List[str] = []
-    for idx in sorted(indexed.keys()):
-        cells = indexed[idx]
-        out_lines.append(" | ".join([str(idx)] + cells))
-    for o in orphans:
-        if o:
-            out_lines.append(" | ".join(o))
-
-    if not out_lines:
-        return ""
-
-    result = "\n".join(out_lines)
-    if len(out_lines) < 3 or not re.search(r"[A-Za-z]", result):
-        return ""
-    return result
-
-
-# ===========================================================================
-#  DOCX
-# ===========================================================================
 def extract_docx(content: bytes) -> str:
     try:
         d = docx.Document(io.BytesIO(content))
@@ -669,9 +541,6 @@ def extract_docx(content: bytes) -> str:
         return ""
 
 
-# ===========================================================================
-#  TEXT → STRUCTURE
-# ===========================================================================
 def text_to_structure(text: str) -> Dict[str, Any]:
     lines = [x.strip() for x in str(text or "").splitlines() if x.strip()]
     if not lines:
@@ -684,8 +553,6 @@ def text_to_structure(text: str) -> Dict[str, Any]:
         if len(cells) < 2:
             continue
         score = sum(1 for c in cells if _classify_basic(c))
-        if "|" in line:
-            score += 2
         if score > best_score:
             best_score, best_idx, best_cells = score, i, cells
 
@@ -824,7 +691,7 @@ def infer_document_type(text: str, items: List[Dict[str, Any]],
 
 
 # ===========================================================================
-#  LEGACY ANALYSIS (fallback if document_engine is missing)
+#  MAIN ANALYSIS (legacy native path — kept as safety fallback)
 # ===========================================================================
 def analyze_bytes(content: bytes, fname: str, ext: str,
                   company_id: int = 0, prompt: str = "") -> Dict[str, Any]:
@@ -945,7 +812,8 @@ def analyze_bytes(content: bytes, fname: str, ext: str,
 
 
 # ===========================================================================
-#  WEB LOOKUP# ===========================================================================
+#  WEB LOOKUP (free, DuckDuckGo instant answer)
+# ===========================================================================
 def web_lookup(query: str) -> Dict[str, Any]:
     if not WEB_LOOKUP_ENABLED or not query:
         return {"ok": False, "reason": "disabled or empty"}
@@ -954,7 +822,7 @@ def web_lookup(query: str) -> Dict[str, Any]:
                + urllib.parse.quote(query)
                + "&format=json&no_html=1&skip_disambig=1")
         req = urllib.request.Request(
-            url, headers={"User-Agent": "AltechSmartDocs/26.0"})
+            url, headers={"User-Agent": "AltechSmartDocs/27.0"})
         with urllib.request.urlopen(req, timeout=WEB_LOOKUP_TIMEOUT) as r:
             data = json.loads(r.read().decode("utf-8", errors="ignore"))
         for key in ("AbstractText", "Answer", "Definition"):
@@ -1050,7 +918,7 @@ async def analyze(
         except Exception as e:
             log.exception("document_engine failed; falling back to legacy")
 
-    # Legacy fallback
+    # Legacy native fallback
     try:
         return analyze_bytes(content, fname, ext, company_id, prompt)
     except Exception as e:
@@ -1091,6 +959,7 @@ async def apply_prompt(req: PromptRequest):
 
 @app.post("/api/lookup")
 async def lookup(req: LookupRequest):
+    """Free web lookup for entity resolution."""
     return web_lookup((req.query or "").strip())
 
 
