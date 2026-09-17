@@ -1,13 +1,12 @@
 """
 ALTECH SOFTWARE DEVELOPERS
-SMART DOCUMENT INTELLIGENCE ENGINE v25
+SMART DOCUMENT INTELLIGENCE ENGINE v26
 --------------------------------------
-Universal document ingestion. Multi-page PDF stitching. Semantic roles.
+Universal document ingestion via a unified document_engine package.
+Unstructured is used as an optional helper for complex files across
+ALL supported types (Excel, CSV, DOCX, PDF, images, text).
 
-This version changes ONLY the PDF extraction path. Excel/CSV/DOCX/OCR
-keep their proven behavior.
-
-Endpoints (unchanged from v24):
+Endpoints (unchanged from v25):
   GET  /                     service info
   GET  /api/ping             liveness
   GET  /api/health           full status
@@ -61,11 +60,23 @@ except Exception as _e:
     chat_process_message = None
     _CHAT_AVAILABLE = False
 
+# ---------------------------------------------------------------------------
+# NEW: Unified document engine (Unstructured-aware, universal file support)
+# ---------------------------------------------------------------------------
+try:
+    from document_engine.pipeline import analyze_document
+    _DOC_ENGINE_AVAILABLE = True
+except Exception as _e:
+    logging.getLogger("altech-engine").warning(
+        f"document_engine not available: {_e}")
+    analyze_document = None
+    _DOC_ENGINE_AVAILABLE = False
+
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("altech-smart-document")
 
-ENGINE_VERSION = "25.0.0"
+ENGINE_VERSION = "26.0.0"
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "40"))
 MAX_ROWS = int(os.getenv("MAX_ROWS", "20000"))
 MAX_SHEETS = int(os.getenv("MAX_SHEETS", "50"))
@@ -233,7 +244,6 @@ def build_columns(headers: List[Any]) -> List[Dict[str, Any]]:
             "source": "original",
         })
 
-    # Resolve role collisions
     role_groups: Dict[str, List[Dict[str, Any]]] = {}
     for c in cols:
         if c["role"]:
@@ -416,7 +426,7 @@ def dataframe_to_structure(df: pd.DataFrame,
 
 
 # ===========================================================================
-#  EXCEL / CSV  (unchanged behavior — this is the working path)
+#  EXCEL / CSV
 # ===========================================================================
 def extract_excel(content: bytes, ext: str) -> List[Dict[str, Any]]:
     if ext == "csv":
@@ -453,7 +463,7 @@ def extract_excel(content: bytes, ext: str) -> List[Dict[str, Any]]:
 
 
 # ===========================================================================
-#  OCR  (unchanged)
+#  OCR
 # ===========================================================================
 def ocr_image(img: Image.Image) -> str:
     img = ImageOps.exif_transpose(img).convert("L")
@@ -476,20 +486,9 @@ def ocr_image(img: Image.Image) -> str:
 
 
 # ===========================================================================
-#  PDF EXTRACTION — the fixed path
+#  PDF EXTRACTION — layout-aware
 # ===========================================================================
 def extract_pdf(content: bytes) -> Tuple[str, str]:
-    """
-    Layout-aware PDF extraction.
-
-    Handles the common case where a single logical table spans multiple
-    pages and each page contributes a different column subset:
-      • Page 1: N, Flower, Variety (names)
-      • Page 3: N, Length, PackRate, Boxes, Qty, Price, Total
-      • Page 4: continuation rows + totals
-
-    Also handles clean single-page PDFs and scanned PDFs (via OCR).
-    """
     if fitz is None:
         try:
             reader = PyPDF2.PdfReader(io.BytesIO(content))
@@ -503,7 +502,6 @@ def extract_pdf(content: bytes) -> Tuple[str, str]:
     except Exception:
         return "", "pdf_open_failed"
 
-    # --- Step 1: read each page's text + block positions ---
     pages: List[Dict[str, Any]] = []
     for page_no, page in enumerate(doc):
         try:
@@ -535,17 +533,14 @@ def extract_pdf(content: bytes) -> Tuple[str, str]:
     if not pages:
         return "", "pdf_empty"
 
-    # --- Step 2: attempt multi-page merge ---
     merged = _merge_pdf_pages(pages)
     if merged:
         return merged, "pdf_merged"
 
-    # --- Step 3: plain concatenation ---
     combined = "\n".join(p["text"] for p in pages if p["text"])
     if len(re.sub(r"\s+", "", combined)) >= 30:
         return combined, "pdf_text"
 
-    # --- Step 4: OCR fallback ---
     try:
         parts = []
         for i, p in enumerate(doc):
@@ -561,7 +556,6 @@ def extract_pdf(content: bytes) -> Tuple[str, str]:
 
 def _blocks_to_rows(blocks: List[Dict[str, Any]],
                     y_tol: float = 4.0) -> List[List[Dict[str, Any]]]:
-    """Group blocks into visual rows by y-proximity."""
     if not blocks:
         return []
     sorted_blocks = sorted(blocks, key=lambda b: (b["y0"], b["x0"]))
@@ -581,7 +575,6 @@ def _blocks_to_rows(blocks: List[Dict[str, Any]],
 
 
 def _count_columns(blocks: List[Dict[str, Any]]) -> int:
-    """Rough x-column count for a set of blocks."""
     buckets = set()
     for b in blocks:
         cx = (b["x0"] + b["x1"]) / 2
@@ -590,16 +583,6 @@ def _count_columns(blocks: List[Dict[str, Any]]) -> int:
 
 
 def _merge_pdf_pages(pages: List[Dict[str, Any]]) -> str:
-    """
-    Merge pages that belong to the same logical table.
-
-    Heuristic:
-      • If every page has < 3 columns, don't merge (probably not a table).
-      • If one page has far more columns than the others, treat it as the
-        numeric continuation of the widest content page.
-      • Collect all rows into a list of cell arrays keyed by their leading
-        numeric index (usually column N).
-    """
     if not pages:
         return ""
 
@@ -607,36 +590,28 @@ def _merge_pdf_pages(pages: List[Dict[str, Any]]) -> str:
         p["column_count"] = _count_columns(p["blocks"])
         p["rows"] = _blocks_to_rows(p["blocks"])
 
-    # Master page = the one with the most columns
     master = max(pages, key=lambda p: p["column_count"])
     if master["column_count"] < 3:
-        return ""  # No table structure; don't merge
+        return ""
 
-    # Collect all rows across pages
-    # Align rows by leading index if one is present
     indexed: Dict[int, List[str]] = {}
     orphans: List[List[str]] = []
 
-    # Sort pages by page_no to keep order
     for p in sorted(pages, key=lambda p: p["page_no"]):
         for row_blocks in p["rows"]:
             cells = [b["text"] for b in row_blocks]
             if not cells:
                 continue
-            # Skip rows that are pure noise (only 1 cell, that cell being
-            # punctuation or a symbol)
             joined = " ".join(cells)
             if len(cells) == 1 and not re.search(r"[A-Za-z0-9]", joined):
                 continue
 
-            # Find the leading integer (row index)
             idx = None
             for j, c in enumerate(cells):
                 n = parse_number(c)
                 if n is not None and float(n).is_integer() \
                         and 1 <= n <= 99999:
                     idx = int(n)
-                    # Remove the index cell so we can merge cleanly
                     cells_no_idx = cells[:j] + cells[j+1:]
                     break
             else:
@@ -648,7 +623,6 @@ def _merge_pdf_pages(pages: List[Dict[str, Any]]) -> str:
 
             if idx in indexed:
                 existing = indexed[idx]
-                # Append only cells that aren't already present
                 for c in cells_no_idx:
                     if c and c not in existing:
                         existing.append(c)
@@ -658,7 +632,6 @@ def _merge_pdf_pages(pages: List[Dict[str, Any]]) -> str:
     if not indexed and not orphans:
         return ""
 
-    # Rebuild a clean tab-separated stream
     out_lines: List[str] = []
     for idx in sorted(indexed.keys()):
         cells = indexed[idx]
@@ -671,14 +644,13 @@ def _merge_pdf_pages(pages: List[Dict[str, Any]]) -> str:
         return ""
 
     result = "\n".join(out_lines)
-    # Sanity check: must contain at least 3 lines and some alphabetic content
     if len(out_lines) < 3 or not re.search(r"[A-Za-z]", result):
         return ""
     return result
 
 
 # ===========================================================================
-#  DOCX  (unchanged)
+#  DOCX
 # ===========================================================================
 def extract_docx(content: bytes) -> str:
     try:
@@ -705,7 +677,6 @@ def text_to_structure(text: str) -> Dict[str, Any]:
     if not lines:
         return {"columns": [], "items": [], "sections": []}
 
-    # Pick the line most likely to be a header
     best_score, best_idx, best_cells = 0, None, None
     for i, line in enumerate(lines[:80]):
         cells = [x.strip() for x in re.split(r"\s*\|\s*|\t+|\s{2,}", line)
@@ -713,14 +684,12 @@ def text_to_structure(text: str) -> Dict[str, Any]:
         if len(cells) < 2:
             continue
         score = sum(1 for c in cells if _classify_basic(c))
-        # Bonus for pipe-separated lines (unambiguous)
         if "|" in line:
             score += 2
         if score > best_score:
             best_score, best_idx, best_cells = score, i, cells
 
     if best_idx is None or best_score == 0:
-        # No header found; return the raw lines as items
         return {
             "columns": [{"key": "raw_text", "label": "Text",
                          "role": None, "source": "original"}],
@@ -855,7 +824,7 @@ def infer_document_type(text: str, items: List[Dict[str, Any]],
 
 
 # ===========================================================================
-#  MAIN ANALYSIS ENTRY POINT
+#  LEGACY ANALYSIS (fallback if document_engine is missing)
 # ===========================================================================
 def analyze_bytes(content: bytes, fname: str, ext: str,
                   company_id: int = 0, prompt: str = "") -> Dict[str, Any]:
@@ -976,8 +945,7 @@ def analyze_bytes(content: bytes, fname: str, ext: str,
 
 
 # ===========================================================================
-#  WEB LOOKUP
-# ===========================================================================
+#  WEB LOOKUP# ===========================================================================
 def web_lookup(query: str) -> Dict[str, Any]:
     if not WEB_LOOKUP_ENABLED or not query:
         return {"ok": False, "reason": "disabled or empty"}
@@ -986,7 +954,7 @@ def web_lookup(query: str) -> Dict[str, Any]:
                + urllib.parse.quote(query)
                + "&format=json&no_html=1&skip_disambig=1")
         req = urllib.request.Request(
-            url, headers={"User-Agent": "AltechSmartDocs/25.0"})
+            url, headers={"User-Agent": "AltechSmartDocs/26.0"})
         with urllib.request.urlopen(req, timeout=WEB_LOOKUP_TIMEOUT) as r:
             data = json.loads(r.read().decode("utf-8", errors="ignore"))
         for key in ("AbstractText", "Answer", "Definition"):
@@ -1038,6 +1006,7 @@ async def root():
         "version": ENGINE_VERSION,
         "status": "operational",
         "chat_engine_available": _CHAT_AVAILABLE,
+        "document_engine_available": _DOC_ENGINE_AVAILABLE,
         "web_lookup_available": WEB_LOOKUP_ENABLED,
     }
 
@@ -1046,6 +1015,7 @@ async def root():
 def ping():
     return {"ok": True, "version": ENGINE_VERSION,
             "chat_engine_available": _CHAT_AVAILABLE,
+            "document_engine_available": _DOC_ENGINE_AVAILABLE,
             "web_lookup_available": WEB_LOOKUP_ENABLED}
 
 
@@ -1054,6 +1024,7 @@ def health():
     return {"status": "healthy", "version": ENGINE_VERSION,
             "ocr_available": True, "pdf_available": fitz is not None,
             "chat_engine_available": _CHAT_AVAILABLE,
+            "document_engine_available": _DOC_ENGINE_AVAILABLE,
             "web_lookup_available": WEB_LOOKUP_ENABLED}
 
 
@@ -1071,6 +1042,15 @@ async def analyze(
         raise HTTPException(413, f"File larger than {MAX_UPLOAD_MB} MB")
     fname = file.filename or "upload"
     ext = (file_type or Path(fname).suffix.lstrip(".")).lower()
+
+    # Preferred: unified document_engine pipeline (Unstructured-aware)
+    if _DOC_ENGINE_AVAILABLE and analyze_document is not None:
+        try:
+            return analyze_document(content, fname, ext, company_id)
+        except Exception as e:
+            log.exception("document_engine failed; falling back to legacy")
+
+    # Legacy fallback
     try:
         return analyze_bytes(content, fname, ext, company_id, prompt)
     except Exception as e:
