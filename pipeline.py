@@ -1,224 +1,254 @@
 """
-Universal document analysis pipeline.
-Routes ALL file types through the appropriate engine.
+Universal document pipeline.
+
+- Uses native app.py helpers for all simple files.
+- Uses Unstructured only for complex files, only for structure; the
+  canonicalization / role classification still comes from app.py.
+- Always falls back to native if Unstructured fails or is missing.
 """
+from __future__ import annotations
+
 import io
 import time
-from typing import Dict, Any, List
+import logging
+from typing import Any, Dict, List
 
 from .detector import detect_engine
-from .unstructured_helper import partition_file
-from .canonical import CanonicalDocument, CanonicalItem
+from .unstructured_helper import partition_file, is_available
+
+log = logging.getLogger("altech-pipeline")
 
 
-def analyze_document(content: bytes, filename: str, ext: str, 
+def analyze_document(content: bytes, filename: str, ext: str,
                      company_id: int = 0) -> Dict[str, Any]:
-    """
-    Universal analysis entry point.
-    Handles Excel, CSV, DOCX, PDF, Images, and Text.
-    """
+    # Import shared helpers from app.py (single source of truth)
+    try:
+        from app import (
+            extract_excel, extract_pdf, extract_docx, ocr_image,
+            text_to_structure, canonicalize, build_columns,
+            infer_document_type, parse_number, ENGINE_VERSION,
+        )
+    except Exception as e:
+        log.exception(f"Unable to import helpers from app.py: {e}")
+        return {
+            "success": False,
+            "engine_version": "unknown",
+            "error": "engine helpers unavailable",
+            "columns": [], "items": [], "raw_items": [],
+        }
+
     started = time.perf_counter()
-    
+    ext = (ext or "").lower()
     engine_choice, use_unstructured = detect_engine(ext, content, filename)
-    
-    structures = []
+
+    structures: List[Dict[str, Any]] = []
     raw_text = ""
     method = engine_choice
-    unstructured_elements = []
+    unstructured_used = False
 
-    # ================================================================
+    # ---------------------------------------------------------------
     # EXCEL / CSV
-    # ================================================================
-    if engine_choice in ("excel", "csv") and not use_unstructured:
-        # Fast path: your proven native logic
-        structures = extract_excel_native(content, ext)
-        method = f"{engine_choice}_native"
-        
-    elif engine_choice in ("excel", "csv") and use_unstructured:
-        # Advanced path: Unstructured handles complex workbooks
-        unstructured_elements = partition_file(content, filename, strategy="hi_res")
-        if unstructured_elements:
-            structures = _unstructured_to_structures(unstructured_elements)
-            method = f"{engine_choice}_unstructured"
-        else:
-            # Fallback to native
-            structures = extract_excel_native(content, ext)
-            method = f"{engine_choice}_native_fallback"
-    
-    # ================================================================
+    # ---------------------------------------------------------------
+    if engine_choice in ("excel", "csv"):
+        if use_unstructured and is_available():
+            elements = partition_file(content, filename, strategy="fast")
+            if elements:
+                structures = _unstructured_to_structures(elements, build_columns)
+                method = f"{engine_choice}_unstructured"
+                unstructured_used = True
+        if not structures:
+            structures = extract_excel(content, ext)
+            method = f"{engine_choice}_native"
+
+    # ---------------------------------------------------------------
     # DOCX
-    # ================================================================
-    elif engine_choice == "docx" and not use_unstructured:
-        raw_text = extract_docx_native(content)
-        method = "docx_native"
-        
-    elif engine_choice == "docx" and use_unstructured:
-        unstructured_elements = partition_file(content, filename, strategy="hi_res")
-        if unstructured_elements:
-            structures = _unstructured_to_structures(unstructured_elements)
-            method = "docx_unstructured"
-        else:
-            raw_text = extract_docx_native(content)
-            method = "docx_native_fallback"
-    
-    # ================================================================
+    # ---------------------------------------------------------------
+    elif engine_choice == "docx":
+        if use_unstructured and is_available():
+            elements = partition_file(content, filename, strategy="fast")
+            if elements:
+                structures = _unstructured_to_structures(elements, build_columns)
+                method = "docx_unstructured"
+                unstructured_used = True
+        if not structures:
+            raw_text = extract_docx(content)
+            structures = [text_to_structure(raw_text)] if raw_text else []
+            method = "docx_native"
+
+    # ---------------------------------------------------------------
     # PDF
-    # ================================================================
-    elif engine_choice == "pdf" and not use_unstructured:
-        # Fast path: native PyMuPDF
-        raw_text, method = extract_pdf_native(content)
-        structures = [text_to_structure(raw_text)]
-        
-    elif engine_choice == "pdf" and use_unstructured:
-        # Advanced path: layout-aware extraction
-        unstructured_elements = partition_file(content, filename, strategy="hi_res")
-        if unstructured_elements:
-            structures = _unstructured_to_structures(unstructured_elements)
-            method = "pdf_unstructured_hi_res"
-        else:
-            raw_text, method = extract_pdf_native(content)
-            method = "pdf_native_fallback"
-    
-    # ================================================================
-    # IMAGES (always Unstructured for OCR + layout)
-    # ================================================================
+    # ---------------------------------------------------------------
+    elif engine_choice == "pdf":
+        if use_unstructured and is_available():
+            # hi_res is better for tables but slower; only used when
+            # the detector already said the PDF is complex/scanned.
+            elements = partition_file(content, filename, strategy="hi_res")
+            if elements:
+                structures = _unstructured_to_structures(elements, build_columns)
+                method = "pdf_unstructured_hi_res"
+                unstructured_used = True
+        if not structures:
+            raw_text, method = extract_pdf(content)
+            structures = [text_to_structure(raw_text)] if raw_text else []
+            method = f"{method}_native"
+
+    # ---------------------------------------------------------------
+    # IMAGE
+    # ---------------------------------------------------------------
     elif engine_choice == "image":
-        unstructured_elements = partition_file(content, filename, strategy="hi_res")
-        if unstructured_elements:
-            structures = _unstructured_to_structures(unstructured_elements)
-            method = "image_unstructured_ocr"
-        else:
-            # Fallback to basic Tesseract
-            raw_text = ocr_image_native(content)
-            method = "image_tesseract_fallback"
-    
-    # ================================================================
-    # TEXT / JSON
-    # ================================================================
+        if is_available():
+            elements = partition_file(content, filename, strategy="hi_res")
+            if elements:
+                structures = _unstructured_to_structures(elements, build_columns)
+                method = "image_unstructured"
+                unstructured_used = True
+        if not structures:
+            try:
+                from PIL import Image
+                raw_text = ocr_image(Image.open(io.BytesIO(content)))
+                structures = [text_to_structure(raw_text)] if raw_text else []
+                method = "image_tesseract"
+            except Exception as e:
+                log.warning(f"Image OCR fallback failed: {e}")
+                method = "image_failed"
+
+    # ---------------------------------------------------------------
+    # TEXT / JSON / unknown
+    # ---------------------------------------------------------------
     else:
         raw_text = content.decode("utf-8", errors="ignore")
-        structures = [text_to_structure(raw_text)]
+        structures = [text_to_structure(raw_text)] if raw_text else []
         method = "text_native"
-    
-    # Normalize everything into Canonical Items
-    canonical_items = _normalize_to_canonical(
-        structures, unstructured_elements, engine_choice
-    )
-    
+
+    # ---------------------------------------------------------------
+    # No structures → report failure
+    # ---------------------------------------------------------------
+    if not structures:
+        return {
+            "success": False,
+            "engine_version": ENGINE_VERSION,
+            "error": "No readable structure was detected.",
+            "columns": [], "items": [], "raw_items": [],
+            "raw_text": raw_text[:20000],
+            "diagnostics": {
+                "stage": "ingestion", "file": filename,
+                "method": method, "trust_score": 0,
+                "confidence_band": "review",
+                "unstructured_used": unstructured_used,
+            },
+        }
+
+    # ---------------------------------------------------------------
+    # Canonicalize exactly like app.py did
+    # ---------------------------------------------------------------
+    primary_columns = structures[0].get("columns", [])
+    merged_items = []
+    sheet_names = []
+    for s in structures:
+        sheet_names.append(s.get("sheet") or "")
+        for row in s.get("items", []):
+            r = dict(row)
+            r["_sheet"] = s.get("sheet") or None
+            merged_items.append(r)
+
+    items = canonicalize({"columns": primary_columns, "items": merged_items})
+
+    total_qty = sum(parse_number(r.get("quantity")) or 0 for r in items)
+    total_amount = sum(parse_number(r.get("total")) or 0 for r in items)
+
+    trust = (sum(r["_meta"]["confidence"] for r in items) / len(items)
+             if items else 0.25)
+    anomalies = [
+        {"row": r["_meta"]["row_index"], "code": w}
+        for r in items for w in r["_meta"]["warnings"]
+    ]
+    trust = round(max(0, min(1, trust - 0.03 * len(anomalies))), 3)
+
     return {
         "success": True,
-        "engine_version": "26.0.0",
+        "engine_version": ENGINE_VERSION,
         "filename": filename,
         "file_type": ext,
         "extraction_method": method,
-        "document_type": "line_item_document",
-        "items": [item.dict() for item in canonical_items],
-        "raw_text": raw_text[:5000] if raw_text else "",
+        "document_type": infer_document_type(raw_text, items, filename),
+        "columns": primary_columns,
+        "items": items,
+        "raw_items": items,
+        "item_count": len(items),
+        "total_quantity": int(total_qty) if total_qty else 0,
+        "total_amount": round(total_amount, 2),
+        "raw_text": raw_text[:20000],
         "diagnostics": {
+            "sheets": sheet_names,
+            "trust_score": trust,
+            "confidence_band": ("high" if trust >= 0.85
+                                else "medium" if trust >= 0.65
+                                else "review"),
+            "anomalies": anomalies,
             "engine_selected": engine_choice,
-            "unstructured_used": len(unstructured_elements) > 0,
-            "elapsed": round(time.perf_counter() - started, 3)
-        }
+            "unstructured_used": unstructured_used,
+        },
+        "elapsed_seconds": round(time.perf_counter() - started, 3),
+        "company_id": company_id,
     }
 
 
-def _unstructured_to_structures(elements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _unstructured_to_structures(elements: List[Dict[str, Any]],
+                                build_columns) -> List[Dict[str, Any]]:
     """
-    Convert Unstructured elements into your existing structure format.
-    Handles tables (via HTML parsing), text lines, and key-value pairs.
+    Convert Unstructured elements into the same structure format app.py uses.
+    Tables → real columns/items.
+    Text lines → single raw_text column.
     """
-    import re
     try:
         from bs4 import BeautifulSoup
     except ImportError:
         BeautifulSoup = None
-    
-    structures = []
-    current_items = []
-    
+
+    structures: List[Dict[str, Any]] = []
+    text_lines: List[str] = []
+
     for el in elements:
         text = (el.get("text") or "").strip()
         if not text:
             continue
-        
-        # TABLE: parse HTML into rows
-        if el.get("role") == "table" and el.get("table_html") and BeautifulSoup:
-            soup = BeautifulSoup(el["table_html"], "html.parser")
-            table_rows = []
-            headers = []
-            
-            # Extract header row
-            for tr in soup.find_all("tr"):
-                cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
-                if cells and not headers:
-                    headers = cells
-                elif cells:
-                    table_rows.append(cells)
-            
-            if headers:
-                # Build column definitions
-                columns = [{"key": f"col_{i}", "label": h, "role": _classify_basic(h)} 
-                          for i, h in enumerate(headers)]
-                # Build items
+
+        if (el.get("role") == "table"
+                and el.get("table_html")
+                and BeautifulSoup is not None):
+            try:
+                soup = BeautifulSoup(el["table_html"], "html.parser")
+                headers: List[str] = []
+                rows: List[List[str]] = []
+                for tr in soup.find_all("tr"):
+                    cells = [td.get_text(strip=True)
+                             for td in tr.find_all(["td", "th"])]
+                    if cells and not headers:
+                        headers = cells
+                    elif cells:
+                        rows.append(cells)
+                if not headers:
+                    continue
+                columns = build_columns(headers)
                 items = []
-                for row in table_rows:
-                    record = {}
+                for row in rows:
+                    record: Dict[str, Any] = {}
                     for j, col in enumerate(columns):
                         record[col["key"]] = row[j] if j < len(row) else None
                     items.append(record)
-                structures.append({"columns": columns, "items": items, 
-                                  "sheet": f"Table_p{el.get('page_number', '?')}"})
+                structures.append({
+                    "columns": columns,
+                    "items": items,
+                    "sheet": f"Table_p{el.get('page_number', '?')}",
+                })
+            except Exception as e:
+                log.warning(f"Table parse failed: {e}")
             continue
-        
-        # KEY-VALUE PAIR: "Product: Hydrangea"
-        if ":" in text and len(text) < 100:
-            key, val = text.split(":", 1)
-            current_items.append({
-                key.strip().lower().replace(" ", "_"): val.strip(),
-                "_type": "key_value"
-            })
-            continue
-        
-        # TEXT LINE: accumulate for later table detection
-        if el.get("role") in ("text", "narrative", "list_item"):
-            current_items.append({
-                "raw_text": text,
-                "_page": el.get("page_number"),
-                "_coords": el.get("coordinates"),
-            })
-    
-    # If we have accumulated text lines, try to structure them
-    if current_items and not structures:
-        structures.append(_lines_to_structure(current_items))
-    
+
+        text_lines.append(text)
+
+    if text_lines and not structures:
+        from app import text_to_structure
+        structures.append(text_to_structure("\n".join(text_lines)))
+
     return structures
-
-
-def _lines_to_structure(lines: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Convert a list of text lines into a structured table.
-    Uses coordinate alignment if available.
-    """
-    # Simple heuristic: find header line, then parse subsequent lines
-    # This is where you'd implement your advanced table detection
-    items = []
-    for line in lines:
-        text = line.get("raw_text", "")
-        if text:
-            items.append({"raw_text": text, "product_name": text[:50]})
-    return {
-        "columns": [{"key": "raw_text", "label": "Text", "role": None}],
-        "items": items,
-        "sheet": "Unstructured_Lines"
-    }
-
-
-def _normalize_to_canonical(structures, unstructured_elements, engine_choice) -> List[CanonicalItem]:
-    """
-    Map all extracted data into the standard CanonicalItem format.
-    This is what chat_engine.py will consume.
-    """
-    # ... (Implementation: take items from structures, map fields,
-    #      add _meta with provenance, create CanonicalItem objects)
-    # This is the same as before but now handles ALL file types.
-    pass
