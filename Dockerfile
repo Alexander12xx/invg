@@ -19,7 +19,7 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 
 COPY *.py .
-COPY document_engine/ ./document_engine/ 2>/dev/null || true
+COPY document_engine/ ./document_engine/
 
 EXPOSE 8000
 
