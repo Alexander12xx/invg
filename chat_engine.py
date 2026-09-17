@@ -1,35 +1,28 @@
 """
 ALTECH SOFTWARE DEVELOPERS
-INTELLIGENT COMMAND ENGINE v25
+INTELLIGENT COMMAND ENGINE v26
 ------------------------------
-Document-aware command execution with much deeper natural-language
-understanding.
+Document-aware command execution with robust price parsing,
+read-cell queries, and self-naming column creation.
 
-NEW IN v25:
-  • Column-creation parser that understands:
-      create a column for flower names
-      add a column for flower names
-      make a column with flower names
-      add flower names column
-      I want a column of flower names
-      add a column that contains flower names
-      add a new column called Flower Names
-      create column "Flower" with the flower names
-    The engine finds the SOURCE column whose content matches "flower names"
-    and copies its values into a new column. If the source is missing, it
-    asks which existing column to use.
-
-  • Copy-column parser:
-      copy flower into a new column called Item
-      duplicate the Variety column as Variety2
-
-  • Rename-column parser (already existed, now more flexible):
-      rename Variety to Cultivar
-      change the name of Flower to Item
-
-  • Better fallback: when a command looks like "add <something>", the
-    engine tries to match <something> to an existing column and offers
-    options, instead of failing with "I could not interpret".
+NEW IN v26:
+  • _parse_price_command rewritten so the TARGET comes from before the
+    price verb, not from "the last noun". Handles:
+      "add unit price 0.5 to all Hydrangea"
+      "TO ALL HYDRANGEA ADD UNIT PRICE 0.5"
+      "set price 0.5 for all Hydrangea"
+      "Hydrangea unit price 0.5"
+  • Multi-line input joined with "; " so "TO ALL HYDRANGEA ONLY\n
+    ADD UNIT PRICE 0.5" becomes one command.
+  • Read-cell queries:
+      "what colour is Hydrangea scarlet"
+      "what is the price of Carnation Everest"
+      "show me the variety of Hydrangea bianca"
+  • Smart column-naming for "ADD LINE TOTAL COLUMN":
+      "add line total column"  → computes quantity × unit_price into
+                                  "Line Total"
+      "add unit price column"  → creates empty "Unit Price"
+      "add X column"           → creates empty X
 """
 
 from __future__ import annotations
@@ -76,11 +69,11 @@ ROLE_ALIASES = {
     ],
     "unit_price": [
         "price", "unit price", "unit_price", "rate", "cost",
-        "unit cost", "price per stem", "price/stem",
+        "unit cost", "price per stem", "price/stem", "unit price (usd)",
     ],
     "total": [
         "total", "amount", "line total", "line amount",
-        "total amount", "extended price", "revenue",
+        "total amount", "extended price", "revenue", "line total (usd)",
     ],
     "length_cm": [
         "length", "length cm", "length (cm)", "length(cm)",
@@ -399,7 +392,7 @@ def _is_all(target):
     generic = {
         "rows", "row", "items", "item", "entries", "lines", "line",
         "flowers", "flower", "products", "product", "records",
-        "everything", "here",
+        "everything", "here", "only",
     }
     return stripped in generic
 
@@ -409,6 +402,7 @@ def _target_rows(items, columns, target):
         return list(range(len(items))), []
     t = _norm(target)
     t = re.sub(r"^(?:all|every|each)\s+", "", t).strip()
+    t = re.sub(r"\s+only$", "", t).strip()
     if not t:
         return list(range(len(items))), []
     hits, ranked = resolve_product(items, columns, t)
@@ -454,260 +448,204 @@ def _find_column_by_label(columns, label):
 
 
 # ===========================================================================
-#  NEW v25: COLUMN CREATION PARSER
+#  READ-CELL QUERIES
+#  "what colour is Hydrangea scarlet"
+#  "what is the price of Carnation Everest"
+#  "show me the variety of Hydrangea bianca"
 # ===========================================================================
-# Common nouns users type that should map to an existing column role.
-SOURCE_NOUN_HINTS = {
-    "product_name": [
-        "flower", "flowers", "flower name", "flower names", "item",
-        "items", "item name", "product", "products", "product name",
-        "description", "descriptions",
-    ],
-    "variety": [
-        "variety", "varieties", "cultivar", "cultivars",
-    ],
-    "quantity": [
-        "quantity", "quantities", "qty", "stems", "stem count",
-    ],
-    "unit_price": [
-        "price", "prices", "unit price", "unit prices", "rate", "rates",
-    ],
-    "total": [
-        "total", "totals", "amount", "amounts", "line total",
-    ],
-    "color": ["color", "colors", "colour", "colours"],
-    "length_cm": ["length", "lengths", "size", "sizes"],
-    "boxes": ["boxes", "box", "cartons"],
-    "pack_rate": ["pack rate", "packrate"],
+QUESTION_WORDS = {
+    "colour", "color", "colours", "colors", "shade",
+    "price", "prices", "cost", "costs", "rate", "rates",
+    "variety", "varieties", "cultivar", "cultivars",
+    "length", "lengths", "size", "sizes",
+    "quantity", "quantities", "qty", "stems",
+    "total", "totals", "amount", "amounts",
+    "box", "boxes", "cartons", "carton",
+    "pack", "rate", "head", "size",
+    "flower", "flowers", "item", "items",
+    "description", "descriptions",
 }
 
 
-def _source_column_from_noun(columns, noun_phrase):
+def _handle_read_cell(items, columns, msg):
     """
-    Given a noun phrase like "flower names" or "varieties", find the
-    column whose values best match. Returns (column, options) where
-    column may be None if we couldn't decide.
-    """
-    np_norm = _norm(noun_phrase)
-    if not np_norm:
-        return None, []
-
-    # Direct hits on labels/keys first
-    col, alternatives = resolve_column(columns, noun_phrase)
-    if col:
-        return col, [c for _, c in alternatives] if alternatives else []
-
-    # Direct hits on role-hint nouns
-    best_hint_role = None
-    best_score = 0
-    for role, hints in SOURCE_NOUN_HINTS.items():
-        for h in hints:
-            s = max(fuzz.WRatio(np_norm, _norm(h)),
-                    fuzz.token_set_ratio(np_norm, _norm(h)))
-            if s > best_score:
-                best_score, best_hint_role = s, role
-
-    if best_hint_role and best_score >= 78:
-        # Find a column with that role
-        for c in columns:
-            if c.get("role") == best_hint_role:
-                return c, []
-        # If no column has that role, fall through to option list
-
-    # Fallback: return a short list of candidate columns for clarification
-    candidates = []
-    for c in columns:
-        candidates.append({
-            "label": c.get("label") or c["key"],
-            "key": c["key"],
-        })
-    return None, candidates
-
-
-def _create_column_from_source(items, columns, new_label, source_noun):
-    """
-    Create a new column with `new_label` and fill it with values from
-    the column that best matches `source_noun`.
-    """
-    source_col, options = _source_column_from_noun(columns, source_noun)
-
-    if source_col is None:
-        # Can't identify which column to copy from — ask the user
-        return _clarify(
-            items, columns,
-            f"Which existing column should I copy into "
-            f"“{new_label}”?",
-            [o["label"] for o in options[:8]])
-
-    new_label = (new_label or source_col.get("label")
-                 or source_col["key"])[:80]
-    columns, new_key = _add_column(columns, new_label, source_col.get("role"))
-    out = []
-    for row in items:
-        r = dict(row)
-        r[new_key] = row.get(source_col["key"])
-        out.append(r)
-    return _ok(
-        out, columns,
-        f"Added column “{new_label}” with values from "
-        f"“{source_col.get('label', source_col['key'])}”.")
-
-
-def _handle_create_column(items, columns, msg):
-    """
-    Recognize every natural phrasing for creating a new column whose
-    values come from an existing column.
+    Answers queries like:
+      what colour is Hydrangea scarlet
+      what is the price of Carnation Everest
+      show me the variety of Hydrangea bianca
+      tell me the length of Spray Rose Bombastic
     """
     low = _norm(msg)
+    if not low:
+        return None
 
-    # Pattern 1: "add/create/make a column called X" — no source, just
-    # an empty column, UNLESS the message also names what should go in it.
-    # Pattern 2: "add/create/make a column for/with/of X"
-    # Pattern 3: "add/create/make X column"
-    # Pattern 4: "I want/need a column of X"
-
-    patterns = [
-        # "create a column for flower names"
-        rf"\b(?:create|add|make|insert|need|want|build|generate)\b"
-        rf"(?:\s+\w+){{0,3}}\s+column\s+"
-        rf"(?:for|with|of|holding|containing|that\s+holds|that\s+contains)\s+"
-        rf"(?P<source>.+)$",
-
-        # "create a column that contains flower names"
-        rf"\b(?:create|add|make|insert|need|want|build|generate)\b"
-        rf"(?:\s+\w+){{0,3}}\s+column\s+"
-        rf"(?:that\s+)?(?:contains?|holds?|lists?|shows?)\s+"
-        rf"(?P<source>.+)$",
-
-        # "add a column called X with flower names"
-        rf"\b(?:create|add|make)\b(?:\s+\w+){{0,3}}\s+column\s+"
-        rf"(?:called|named)\s+(?P<label>.+?)\s+"
-        rf"(?:with|containing|holding|of|using|from|as)\s+(?P<source>.+)$",
-
-        # "create a flower names column"
-        rf"\b(?:create|add|make|insert|need|want|build|generate)\b"
-        rf"(?:\s+\w+){{0,3}}\s+(?P<label>[a-z][a-z0-9 _\-]+?)\s+column\b"
-        rf"(?:\s+(?:with|containing|holding|of|using|from)\s+"
-        rf"(?P<source>.+))?$",
-    ]
-
-    for pat in patterns:
-        m = re.search(pat, low)
-        if not m:
-            continue
-        gd = m.groupdict()
-        label = (gd.get("label") or "").strip()
-        source = (gd.get("source") or "").strip()
-
-        # Clean trailing noise
-        source = re.sub(r"\s+(?:column|field|please|thanks?)\.?$",
-                        "", source, flags=re.I).strip(" .,;:!?")
-        label = re.sub(r"\s+(?:column|field|please|thanks?)\.?$",
-                       "", label, flags=re.I).strip(" .,;:!?")
-
-        if not source and not label:
-            continue
-
-        # If the source phrase literally names a column or role, use it.
-        if source:
-            # Strip common leading articles
-            source = re.sub(r"^(?:the\s+|a\s+|an\s+)", "", source,
-                            flags=re.I).strip()
-            # Cap length
-            source = source[:80]
-            # If label wasn't given, derive it from the source noun
-            if not label:
-                label = source
-            return _create_column_from_source(items, columns, label, source)
-
-        # No source — just an empty column with the given name
-        if label:
-            columns, key = _add_column(columns, label, None)
-            out = [dict(r, **{key: None}) for r in items]
-            return _ok(out, columns, f"Added a new empty column “{label}”.")
-
-    return None
-
-
-def _handle_copy_column(items, columns, msg):
-    """
-    copy X into a new column called Y
-    duplicate X as Y
-    """
-    m = re.search(
-        r"\b(?:copy|duplicate|clone)\b\s+(?:the\s+)?([a-z0-9 _\-]+?)\s+"
-        r"(?:into|to|as)\s+(?:a\s+new\s+column\s+)?"
-        r"(?:called\s+|named\s+)?([a-z0-9 _\-]+)$",
-        _norm(msg))
+    # Strip the leading question verb
+    m = re.match(
+        r"^(?:what(?:'s|\s+is|\s+are)?|show(?:\s+me)?|tell(?:\s+me)?|"
+        r"give(?:\s+me)?|list|find)\s+"
+        r"(?:the\s+)?(.+?)\s*$", low)
     if not m:
         return None
-    source_noun = m.group(1).strip()
-    target_label = m.group(2).strip()
-    return _create_column_from_source(items, columns, target_label,
-                                       source_noun)
+    rest = m.group(1).strip()
 
+    # "colour is X" | "colour of X" | "X's colour"
+    m2 = re.match(
+        r"^(?P<field>[a-z][a-z0-9 _\-]*?)\s+"
+        r"(?:is|of|for|in)\s+"
+        r"(?P<target>.+)$", rest)
+    if m2:
+        field_word = m2.group("field").strip()
+        target = m2.group("target").strip()
+    else:
+        # "<target>'s colour" or "<target> colour"
+        m3 = re.match(
+            r"^(?P<target>.+?)[\s'’]s?\s+"
+            r"(?P<field>[a-z][a-z0-9 _\-]*?)\s*$", rest)
+        if m3:
+            target = m3.group("target").strip()
+            field_word = m3.group("field").strip()
+        else:
+            return None
 
-# ===========================================================================
-#  WEB LOOKUP
-# ===========================================================================
-def _web_lookup(query: str) -> Optional[str]:
-    if not query:
+    # Normalize the field word
+    field_word = re.sub(r"\s+(?:is|are|of|for|in)$", "",
+                        field_word).strip()
+
+    # Only proceed if the field word is a question-word
+    if field_word not in QUESTION_WORDS:
         return None
-    try:
-        url = ("https://api.duckduckgo.com/?q="
-               + urllib.parse.quote(query)
-               + "&format=json&no_html=1&skip_disambig=1")
-        req = urllib.request.Request(
-            url, headers={"User-Agent": "AltechSmartDocs/25.0"})
-        with urllib.request.urlopen(req, timeout=5) as r:
-            data = json.loads(r.read().decode("utf-8", errors="ignore"))
-        for key in ("AbstractText", "Answer", "Definition"):
-            v = data.get(key)
-            if v and isinstance(v, str) and len(v.strip()) > 4:
-                return v.strip()[:300]
-    except Exception:
-        pass
-    return None
+
+    # Resolve the column from the field word
+    col, _ = resolve_column(columns, field_word)
+    if not col:
+        return None
+
+    # Find the row
+    rows, ranked = _target_rows(items, columns, target)
+    if not rows:
+        return _clarify(
+            items, columns,
+            f"I couldn't find a row matching “{target}”.", [])
+
+    # If one row, answer directly. If several, answer for the first
+    idx = rows[0]
+    row = items[idx]
+    value = row.get(col["key"])
+    if value in (None, ""):
+        return _ok(items, columns,
+                   f"“{col['label']}” is empty for that row.")
+    # Try to find the row's name
+    name = None
+    for pk in _product_keys(columns):
+        v = row.get(pk)
+        if v not in (None, ""):
+            name = v
+            break
+    label = f"“{name}”" if name else f"row {idx + 1}"
+    return _ok(items, columns,
+               f"{label} — {col['label']}: {value}")
 
 
 # ===========================================================================
-#  PRICE COMMAND PARSER
+#  PRICE COMMAND PARSER — fully re-anchored on the price verb
 # ===========================================================================
-VERBS = r"(?:set|change|update|make|apply|assign|give|put|add|fill|edit)"
+PRICE_VERBS = r"(?:add|set|change|apply|make|assign|put|update|give|fill)"
 PRICE_WORDS = r"(?:unit\s*price|unit_price|price|rate|cost|unit\s*cost)"
 
 
 def _parse_price_command(msg: str):
+    """
+    Return (target, value, field) or (None, None, None).
+
+    The TARGET comes from either before the verb or after a preposition.
+    Never picks up the trailing words after the price.
+
+    Handles:
+      "To all Hydrangea add unit price 0.5"
+      "add unit price 0.5 to all Hydrangea"
+      "set unit price 0.5 for all Hydrangea"
+      "change unit price of Hydrangea to 0.5"
+      "Hydrangea unit price 0.5"
+      "Hydrangea @ 0.5"
+    """
     m_text = msg.strip()
 
+    # Normalize: collapse newlines and extra whitespace
+    m_text = re.sub(r"\s+", " ", m_text)
+
+    # --- Pattern A: VERB-LEADING with target in a preposition tail ---
+    # "add/set unit price 0.5 to/for/on [all] Hydrangea"
     m = re.match(
-        rf"^\s*(?:to\s+)?(?P<target>.+?)\s+(?P<field>[a-z][a-z0-9 _\-]*?)\s+"
+        rf"^\s*{PRICE_VERBS}\s+(?:a\s+|the\s+)?"
+        rf"(?P<field>[a-z][a-z0-9 _\-]*?)\s+"
+        rf"\$?\s*(?P<value>[\d,]+(?:\.\d+)?)\s+"
+        rf"(?:to|for|on|in)\s+(?:all\s+|every\s+|the\s+)?"
+        rf"(?P<target>.+?)\s*$",
+        m_text, re.I)
+    if m:
+        field = m.group("field").strip()
+        # field must look like a column name
+        if re.match(r"^[a-z][a-z0-9 _\-]{1,30}$", field, re.I):
+            return (m.group("target").strip(),
+                    _num(m.group("value")), field)
+
+    # --- Pattern B: VERB-LEADING with target at front ---
+    # "set Hydrangea price to 0.5" / "change Hydrangea unit price to 0.5"
+    m = re.match(
+        rf"^\s*{PRICE_VERBS}\s+(?P<target>.+?)\s+"
+        rf"(?P<field>[a-z][a-z0-9 _\-]*?)\s+"
+        rf"(?:to|=|:)\s*\$?\s*(?P<value>[\d,]+(?:\.\d+)?)\s*$",
+        m_text, re.I)
+    if m:
+        return (m.group("target").strip(),
+                _num(m.group("value")), m.group("field").strip())
+
+    # --- Pattern C: VERB-LEADING with target in a preposition tail ---
+    # "set price 0.5 for Hydrangea" / "add price 0.5 to Hydrangea"
+    m = re.match(
+        rf"^\s*{PRICE_VERBS}\s+(?P<field>[a-z][a-z0-9 _\-]*?)\s+"
+        rf"\$?\s*(?P<value>[\d,]+(?:\.\d+)?)\s+"
+        rf"(?:to|for|on|in)\s+(?:all\s+|every\s+|the\s+)?"
+        rf"(?P<target>.+?)\s*$",
+        m_text, re.I)
+    if m:
+        field = m.group("field").strip()
+        if re.match(r"^[a-z][a-z0-9 _\-]{1,30}$", field, re.I):
+            return (m.group("target").strip(),
+                    _num(m.group("value")), field)
+
+    # --- Pattern D: TARGET-LEADING, verb-less ---
+    # "To all Hydrangea add unit price 0.5"
+    m = re.match(
+        rf"^\s*(?:to\s+)?(?P<target>.+?)\s+"
+        rf"{PRICE_VERBS}\s+(?:a\s+|the\s+)?"
+        rf"(?P<field>[a-z][a-z0-9 _\-]*?)\s+"
         rf"\$?\s*(?P<value>[\d,]+(?:\.\d+)?)\s*$",
         m_text, re.I)
     if m:
         target = m.group("target").strip()
         target = re.sub(r"^to\s+", "", target, flags=re.I).strip()
         field = m.group("field").strip()
-        if target and field and field.lower() not in ("to", "for", "on"):
-            if re.search(PRICE_WORDS, field, re.I) or \
-               re.match(r"^[a-z][a-z0-9 _\-]{1,30}$", field, re.I):
-                return target, _num(m.group("value")), field
+        if re.match(r"^[a-z][a-z0-9 _\-]{1,30}$", field, re.I):
+            return target, _num(m.group("value")), field
 
+    # --- Pattern E: "<target> <field> <value>" (verb-less, no "to") ---
     m = re.match(
-        rf"^\s*{VERBS}\s+{PRICE_WORDS}\s+(?:of\s+|for\s+|to\s+|on\s+)?"
-        rf"(?P<target>.+?)\s+(?:to|=|:)\s*\$?\s*"
-        rf"(?P<value>[\d,]+(?:\.\d+)?)\s*$",
+        rf"^\s*(?:to\s+)?(?P<target>.+?)\s+"
+        rf"(?P<field>[a-z][a-z0-9 _\-]*?)\s+"
+        rf"\$?\s*(?P<value>[\d,]+(?:\.\d+)?)\s*$",
         m_text, re.I)
     if m:
-        return m.group("target").strip(), _num(m.group("value")), "unit price"
+        target = m.group("target").strip()
+        target = re.sub(r"^to\s+", "", target, flags=re.I).strip()
+        field = m.group("field").strip()
+        # Field must look like a column name (not "to/for/on")
+        if field.lower() in ("to", "for", "on", "in"):
+            return None, None, None
+        if re.match(r"^[a-z][a-z0-9 _\-]{1,30}$", field, re.I):
+            return target, _num(m.group("value")), field
 
-    m = re.match(
-        rf"^\s*{VERBS}\s+(?P<target>.+?)\s+{PRICE_WORDS}\s+"
-        rf"(?:to|=|:)\s*\$?\s*(?P<value>[\d,]+(?:\.\d+)?)\s*$",
-        m_text, re.I)
-    if m:
-        return m.group("target").strip(), _num(m.group("value")), "unit price"
-
+    # --- Pattern F: "<target> @ <value>" ---
     m = re.match(
         r"^\s*(?:to\s+)?(?P<target>.+?)\s*@\s*\$?\s*"
         r"(?P<value>[\d,]+(?:\.\d+)?)\s*$",
@@ -764,7 +702,7 @@ def _set_value(items, columns, msg):
         return _apply_column_value(items, columns, col, value, target)
 
     m = re.match(
-        rf"^\s*{VERBS}\s+(?P<field>.+?)\s+(?:to|=|as)\s+(?P<value>.+)$",
+        rf"^\s*{PRICE_VERBS}\s+(?P<field>.+?)\s+(?:to|=|as)\s+(?P<value>.+)$",
         msg, re.I)
     if m:
         field = m.group("field").strip()
@@ -782,6 +720,7 @@ def _apply_column_value(items, columns, col, value, target):
     rows, ranked = _target_rows(items, columns, target)
     if not rows:
         t_norm = _norm(re.sub(r"^(?:all|every|each)\s+", "", target))
+        t_norm = re.sub(r"\s+only$", "", t_norm).strip()
         if t_norm:
             product_keys = _product_keys(columns)
             for i, row in enumerate(items):
@@ -1148,21 +1087,171 @@ def _add_row(items, columns, msg):
     return _ok(out, columns, f"Added a new row for “{name}”.")
 
 
-def _add_empty_column(items, columns, msg):
-    m = re.search(
-        r"\badd\s+(?:a\s+|one\s+)?column\s+"
-        r"(?:called\s+|named\s+|for\s+|with\s+)?([a-z0-9 _\-]+?)\s*$",
-        msg, re.I)
-    if not m:
-        return None
-    label = m.group(1).strip()
-    if not label or len(label) > 60:
-        return None
+# ===========================================================================
+#  COLUMN CREATION — smart naming + fallback
+# ===========================================================================
+COLUMN_NOUN_ALIASES = {
+    "line total": "Line Total",
+    "total": "Total",
+    "amount": "Amount",
+    "revenue": "Revenue",
+    "price": "Price",
+    "unit price": "Unit Price",
+    "cost": "Cost",
+    "rate": "Rate",
+    "quantity": "Quantity",
+    "qty": "Qty",
+    "stems": "Stems",
+    "boxes": "Boxes",
+    "pack rate": "Pack Rate",
+    "length": "Length",
+    "size": "Size",
+    "colour": "Color",
+    "color": "Color",
+    "variety": "Variety",
+    "flower name": "Flower",
+    "flower names": "Flower",
+    "flower": "Flower",
+    "item": "Item",
+    "description": "Description",
+    "notes": "Notes",
+    "comments": "Comments",
+}
+
+
+def _smart_column_label(raw):
+    """Turn user input into a normalized column label."""
+    n = _norm(raw)
+    if n in COLUMN_NOUN_ALIASES:
+        return COLUMN_NOUN_ALIASES[n]
+    # Title-case fallback
+    return " ".join(w.capitalize() for w in raw.split())[:80]
+
+
+def _handle_column_creation(items, columns, msg):
+    """
+    Recognizes:
+      "add line total column"          → compute Qty × Unit Price into "Line Total"
+      "add unit price column"          → create empty "Unit Price"
+      "add a column for flower names"  → copy Flower values into "Flower"
+      "create column called Discount"  → create empty "Discount"
+    """
+    low = _norm(msg)
+
+    # --- Pattern 1: "add <label> column" (label precedes "column") ---
+    m = re.match(
+        r"^(?:add|create|make|new|insert|need|want|build|generate)\s+"
+        r"(?:a\s+|the\s+|one\s+)?"
+        r"(?P<label>[a-z][a-z0-9 _\-]*?)\s+"
+        r"(?:column|field)\s*$",
+        low)
+    if m:
+        label = m.group("label").strip()
+        return _create_or_compute_column(items, columns, label)
+
+    # --- Pattern 2: "add a column [called X] [for/with/of Y]" ---
+    m = re.match(
+        r"^(?:add|create|make|new|insert|need|want|build|generate)\s+"
+        r"(?:a\s+|the\s+|one\s+)?(?:column|field)\s+"
+        r"(?:called\s+|named\s+)?"
+        r"(?:(?P<label>[a-z][a-z0-9 _\-]*?)\s+)?"
+        r"(?:(?:for|with|of|holding|containing|that\s+holds?|that\s+contains)"
+        r"\s+(?P<source>.+?))?\s*$",
+        low)
+    if m:
+        label = (m.group("label") or "").strip()
+        source = (m.group("source") or "").strip()
+        if source:
+            return _create_or_compute_column(items, columns,
+                                             label or source, source)
+        if label:
+            return _create_or_compute_column(items, columns, label)
+
+    # --- Pattern 3: "add column called X" ---
+    m = re.match(
+        r"^(?:add|create|make|new|insert)\s+"
+        r"(?:a\s+|the\s+|one\s+)?(?:column|field)\s+"
+        r"(?:called\s+|named\s+)(?P<label>.+?)\s*$",
+        low)
+    if m:
+        return _create_or_compute_column(items, columns,
+                                         m.group("label").strip())
+
+    return None
+
+
+def _create_or_compute_column(items, columns, label, source_noun=None):
+    """
+    Decide whether "add X column" means:
+      • Compute X from other columns (X = Line Total, Revenue, Amount, etc.)
+      • Copy X from an existing column (source_noun is set)
+      • Create an empty X column
+    """
+    label = _smart_column_label(label)
+    label_norm = _norm(label)
+
+    # If a source was provided, copy from that source
+    if source_noun:
+        col, _ = resolve_column(columns, source_noun)
+        if col:
+            columns, key = _add_column(columns, label, col.get("role"))
+            out = [dict(r, **{key: r.get(col["key"])}) for r in items]
+            return _ok(out, columns,
+                       f"Added column “{label}” with values from "
+                       f"“{col['label']}”.")
+        # No source found — offer existing columns
+        options = [c.get("label") or c["key"] for c in columns][:8]
+        return _clarify(
+            items, columns,
+            f"Which existing column should I copy into “{label}”?",
+            options)
+
+    # Line Total / Total / Amount / Revenue → compute Qty × Unit Price
+    if label_norm in ("line total", "total", "amount", "revenue"):
+        q = _find_role(columns, "quantity")
+        p = _find_role(columns, "unit_price")
+        if q and p:
+            columns, key = _add_column(columns, label, "total")
+            out = []
+            for r in items:
+                v = (_num(r.get(q["key"])) or 0) * \
+                    (_num(r.get(p["key"])) or 0)
+                out.append(dict(r, **{key: round(v, 4)}))
+            return _ok(out, columns,
+                       f"Added column “{label}” = "
+                       f"{q['label']} × {p['label']} for {len(out)} row(s).")
+        # Missing source columns — create an empty column
+        columns, key = _add_column(columns, label, "total")
+        out = [dict(r, **{key: None}) for r in items]
+        return _ok(out, columns,
+                   f"Added empty column “{label}” "
+                   f"(needed Quantity and Unit Price to compute).")
+
+    # Unit Price / Price / Rate / Cost → empty column with unit_price role
+    if label_norm in ("unit price", "price", "rate", "cost"):
+        columns, key = _add_column(columns, label, "unit_price")
+        out = [dict(r, **{key: None}) for r in items]
+        return _ok(out, columns, f"Added empty column “{label}”.")
+
+    # Generic fallback: try to match the label to a source column by role
+    col, _ = resolve_column(columns, label)
+    if col:
+        # User probably wants a copy of the matched column
+        columns, key = _add_column(columns, label, col.get("role"))
+        out = [dict(r, **{key: r.get(col["key"])}) for r in items]
+        return _ok(out, columns,
+                   f"Added column “{label}” copying from "
+                   f"“{col['label']}”.")
+
+    # Otherwise: empty column with the given label
     columns, key = _add_column(columns, label, None)
     out = [dict(r, **{key: None}) for r in items]
     return _ok(out, columns, f"Added a new empty column “{label}”.")
 
 
+# ===========================================================================
+#  REMOVE / RENAME / SORT
+# ===========================================================================
 def _remove_row(items, columns, msg):
     m = re.search(r"\b(?:remove|delete|drop)\s+row\s+(\d+)", msg, re.I)
     if m:
@@ -1252,7 +1341,6 @@ def _remove_rows(items, columns, msg):
         return _ok(out, columns,
                    f"Removed {removed} row(s) where {col['label']} is "
                    f"“{val}”.")
-
     return None
 
 
@@ -1377,6 +1465,11 @@ def _single_command(items, columns, msg):
     if not low:
         return None
 
+    # Read-cell queries MUST come before any other match
+    r = _handle_read_cell(items, columns, msg)
+    if r:
+        return r
+
     # Totals shorthand
     if re.search(r"\b(?:calculate|recalculate|compute)\s+(?:all\s+)?"
                  r"(?:line\s+)?totals?\b", low) \
@@ -1394,18 +1487,12 @@ def _single_command(items, columns, msg):
                  r"(?:all\s+)?duplicates?\b", low):
         return _remove_duplicates(items, columns, msg)
 
-    # Column creation — must come BEFORE other rules so
-    # "add a column for flower names" is handled correctly
-    r = _handle_create_column(items, columns, msg)
-    if r: return r
-    r = _handle_copy_column(items, columns, msg)
-    if r: return r
+    # Column creation — handles "add line total column"
+    r = _handle_column_creation(items, columns, msg)
+    if r:
+        return r
 
-    # Row / column operations
-    r = _add_row(items, columns, msg)
-    if r: return r
-    r = _add_empty_column(items, columns, msg)
-    if r: return r
+    # Row / column removal
     r = _remove_row(items, columns, msg)
     if r: return r
     r = _remove_column(items, columns, msg)
@@ -1413,11 +1500,15 @@ def _single_command(items, columns, msg):
     r = _remove_rows(items, columns, msg)
     if r: return r
 
+    # Add row
+    r = _add_row(items, columns, msg)
+    if r: return r
+
     # Rename
     r = _rename_column(items, columns, msg)
     if r: return r
 
-    # Set value
+    # Set value (price)
     r = _set_value(items, columns, msg)
     if r: return r
 
@@ -1452,12 +1543,37 @@ def _single_command(items, columns, msg):
 
 
 def _split_commands(msg: str) -> List[str]:
-    parts = re.split(r"\s*;\s*|\s+\bthen\b\s+|\r?\n+", msg, flags=re.I)
-    return [p.strip() for p in parts if p.strip()][:MAX_COMMANDS]
+    """
+    Split a compound message into individual commands.
+    Newlines are treated as soft breaks — if a line does not look like a
+    standalone command, it is joined with the previous line.
+    """
+    raw_lines = [x.strip() for x in re.split(r"\r?\n+", msg) if x.strip()]
+    merged: List[str] = []
+    for line in raw_lines:
+        # A line is standalone if it has both a verb and a numeric value,
+        # or if it's short and clearly a command.
+        is_standalone = bool(re.search(
+            r"\b(?:add|set|change|remove|delete|drop|create|make|"
+            r"calculate|compute|sort|rename|apply|update|reset|clear)\b",
+            line, re.I))
+        if merged and not is_standalone:
+            merged[-1] = merged[-1] + " " + line
+        else:
+            merged.append(line)
+
+    # Then split each merged piece on ';' and ' then '
+    final = []
+    for piece in merged:
+        for sub in re.split(r"\s*;\s*|\s+\bthen\b\s+", piece, flags=re.I):
+            sub = sub.strip()
+            if sub:
+                final.append(sub)
+    return final[:MAX_COMMANDS]
 
 
 # ===========================================================================
-#  AI PLANNER (fallback)
+#  AI PLANNER (fallback only)
 # ===========================================================================
 def _ai_plan(message, items, columns, history=None):
     provider = os.getenv("AI_PROVIDER", "auto").lower()
@@ -1469,7 +1585,7 @@ def _ai_plan(message, items, columns, history=None):
   "action": "set_value|calculate_totals|grand_total|compute|add_row|
              add_column|create_column|remove_row|remove_column|
              remove_rows|remove_duplicates|rename_column|sort|
-             aggregate|clarify|none",
+             aggregate|answer_question|clarify|none",
   "target":     "<row filter>",
   "field":      "<column label>",
   "source":     "<source column label, for create_column>",
@@ -1480,10 +1596,9 @@ def _ai_plan(message, items, columns, history=None):
 }
 
 Rules:
-- The user's literal column names win. If they say "Qty", use the column
-  named "Qty" — not "Stems".
+- The user's literal column names win.
 - Never invent values.
-- If unclear, use action "clarify" with an explanation asking the question."""
+- If unclear, use action "clarify"."""
 
     payload = json.dumps({
         "message": message,
@@ -1568,15 +1683,10 @@ def _execute_ai_plan(items, columns, plan):
     if action == "create_column":
         new_label = str(plan.get("new_column") or "New Column")
         source = str(plan.get("source") or plan.get("field") or "")
-        if not source:
-            return _clarify(items, columns,
-                            f"Which column should I copy into "
-                            f"“{new_label}”?", [])
-        return _create_column_from_source(items, columns, new_label, source)
+        return _create_or_compute_column(items, columns, new_label, source)
     if action == "add_column":
-        return _add_empty_column(
-            items, columns,
-            f"add a column called {plan.get('new_column')}")
+        return _create_or_compute_column(
+            items, columns, str(plan.get("new_column") or "New Column"))
     if action == "add_row":
         return _add_row(items, columns,
                         f"add a row for {plan.get('target')}")
@@ -1602,6 +1712,10 @@ def _execute_ai_plan(items, columns, plan):
         func = str(plan.get("operation") or "average")
         col = str(plan.get("field") or "quantity")
         return _aggregate(items, columns, f"{func} {col}")
+    if action == "answer_question":
+        text = str(plan.get("explanation") or "").strip()
+        if text:
+            return _ok(items, columns, text, via="ai")
     if action == "clarify":
         return _clarify(items, columns,
                         str(plan.get("explanation")
