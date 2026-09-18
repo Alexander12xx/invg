@@ -1,27 +1,35 @@
 """
 ALTECH SOFTWARE DEVELOPERS
-INTELLIGENT COMMAND ENGINE v27
+INTELLIGENT COMMAND ENGINE v28
 ------------------------------
 Document-aware command execution with robust price parsing,
-read-cell queries, self-naming column creation, and provenance
-passthrough from the unified document_engine.
+read-cell queries, self-naming column creation, provenance
+passthrough, and flexible rename/replace/use-as handling.
 
-NEW IN v27 (vs v26):
-  • _clean_items now preserves the "_meta" provenance block emitted by
-    document_engine, so future commands can reference source cells /
-    pages / OCR confidence in their explanations.
-  • Nothing else changed — the deterministic command layer is already
-    file-type-agnostic and works with Excel, CSV, PDF, DOCX, images,
-    and Unstructured-derived canonical items.
+NEW IN v28 (vs v27):
+  • _rename_column now handles these phrasings:
+      "rename X to Y"
+      "rename X as Y"
+      "rename the column X to Y"
+      "change X to Y"
+      "change the name of X to Y"
+      "replace X with Y"
+      "replace the column name X with Y"
+      "use X as Y"
+      "use X for Y"
+      "in X use Y"
+      "call X Y"
+      "label X as Y"
+  • _looks_like_total_row is stricter: any cell whose text is
+    total / grand total / subtotal / sum / balance due marks the row
+    as a summary row, even when other cells in the row are numbers.
+  • price parser accepts "use" as a soft verb.
+  • All other v26 behavior preserved.
 
 CARRIED FORWARD FROM v26:
-  • _parse_price_command rewritten so the TARGET comes from before the
-    price verb, not from "the last noun".
-  • Multi-line input joined so multi-line commands become one command.
-  • Read-cell queries:
-      "what colour is Hydrangea scarlet"
-      "what is the price of Carnation Everest"
-      "show me the variety of Hydrangea bianca"
+  • _parse_price_command re-anchored on the price verb.
+  • Multi-line input joined with "; ".
+  • Read-cell queries: "what colour is Hydrangea scarlet"
   • Smart column-naming for "ADD LINE TOTAL COLUMN".
 """
 
@@ -70,14 +78,16 @@ ROLE_ALIASES = {
     "unit_price": [
         "price", "unit price", "unit_price", "rate", "cost",
         "unit cost", "price per stem", "price/stem", "unit price (usd)",
+        "prices totals", "prices", "price total",
     ],
     "total": [
         "total", "amount", "line total", "line amount",
         "total amount", "extended price", "revenue", "line total (usd)",
+        "prices totals",
     ],
     "length_cm": [
         "length", "length cm", "length (cm)", "length(cm)",
-        "stem length", "size",
+        "stem length", "size", "cm",
     ],
     "head_size_cm": ["head size", "head size cm", "head size (cm)"],
     "color": ["color", "colour", "shade"],
@@ -104,6 +114,7 @@ NUMERIC_ROLES = {
 def _norm(s: Any) -> str:
     s = "" if s is None else str(s)
     s = s.lower().replace("–", "-").replace("—", "-").replace("’", "'")
+    s = s.replace("\t", " ")
     return re.sub(r"\s+", " ", s.strip())
 
 
@@ -166,11 +177,14 @@ def _lev(a: str, b: str) -> int:
 
 def _clean_items(items):
     """
-    v27: preserve the "_meta" provenance block emitted by document_engine.
+    Preserve the "_meta" provenance block emitted by document_engine.
+    Also DROP rows that look like totals (defense in depth).
     """
     cleaned = []
     for r in (items or [])[:MAX_ITEMS]:
         if not isinstance(r, dict):
+            continue
+        if _looks_like_total_row(r):
             continue
         x = dict(r)
         if isinstance(r.get("_meta"), dict):
@@ -187,6 +201,69 @@ def _clean_columns(columns):
             x["label"] = str(x.get("label") or x["key"])[:200]
             out.append(x)
     return out
+
+
+TOTAL_ROW_PATTERN = re.compile(
+    r"\b(?:sub\s*total|grand\s*total|invoice\s*total|total\s+amount|"
+    r"balance\s+due|amount\s+due|total\s+price|total\s+stems|"
+    r"total\s+qty|sum|totals?)\b",
+    re.I,
+)
+
+
+def _looks_like_total_row(row: Dict[str, Any]) -> bool:
+    """
+    Stronger than the app.py version: if ANY cell in the row is
+    exactly a total-word (total/totals/subtotal/sum), treat the row
+    as a summary row. Also treat rows whose only meaningful cell is
+    a bare total keyword + number as summaries.
+    """
+    if not isinstance(row, dict):
+        return False
+    # Skip _meta / _sheet keys
+    values = []
+    for k, v in row.items():
+        if k.startswith("_"):
+            continue
+        values.append(v)
+    if not values:
+        return False
+
+    # Rule 1: any cell contains a total keyword
+    for v in values:
+        if v is None:
+            continue
+        s = _norm(v)
+        if not s:
+            continue
+        if TOTAL_ROW_PATTERN.search(s):
+            # If the cell is basically just "total" / "totals" / "sum",
+            # or "total <number>", treat as summary.
+            stripped = re.sub(r"[^a-z0-9]+", " ", s).strip()
+            if stripped in {"total", "totals", "subtotal", "sub total",
+                            "grand total", "sum", "balance due",
+                            "amount due"}:
+                return True
+            if re.fullmatch(
+                r"(?:total|totals|subtotal|sub total|grand total|sum)"
+                r"[\s:]*[-+]?\d[\d,.\s]*", stripped):
+                return True
+
+    # Rule 2: cell that combines "TOTAL" and a number in any order
+    joined = " ".join(_norm(v) for v in values if v not in (None, ""))
+    if re.search(
+        r"\b(?:total|totals|subtotal|grand\s+total)\b"
+        r"[^\n]{0,30}?[-+]?\d",
+        joined,
+    ):
+        # Only if the row has <= 4 non-empty cells (typical summary row)
+        non_empty = sum(1 for v in values if v not in (None, ""))
+        if non_empty <= 4:
+            return True
+
+    # Rule 3: single-cell row that is just a number and the sheet has a
+    # summary keyword somewhere else — handled by Rule 1 already.
+    return False
 
 
 # ===========================================================================
@@ -539,7 +616,7 @@ def _handle_read_cell(items, columns, msg):
 # ===========================================================================
 #  PRICE COMMAND PARSER
 # ===========================================================================
-PRICE_VERBS = r"(?:add|set|change|apply|make|assign|put|update|give|fill)"
+PRICE_VERBS = r"(?:add|set|change|apply|make|assign|put|update|give|fill|use)"
 PRICE_WORDS = r"(?:unit\s*price|unit_price|price|rate|cost|unit\s*cost)"
 
 
@@ -547,6 +624,7 @@ def _parse_price_command(msg: str):
     m_text = msg.strip()
     m_text = re.sub(r"\s+", " ", m_text)
 
+    # --- Pattern A: VERB-LEADING with target in a preposition tail ---
     m = re.match(
         rf"^\s*{PRICE_VERBS}\s+(?:a\s+|the\s+)?"
         rf"(?P<field>[a-z][a-z0-9 _\-]*?)\s+"
@@ -560,6 +638,7 @@ def _parse_price_command(msg: str):
             return (m.group("target").strip(),
                     _num(m.group("value")), field)
 
+    # --- Pattern B: VERB-LEADING with target at front ---
     m = re.match(
         rf"^\s*{PRICE_VERBS}\s+(?P<target>.+?)\s+"
         rf"(?P<field>[a-z][a-z0-9 _\-]*?)\s+"
@@ -569,6 +648,7 @@ def _parse_price_command(msg: str):
         return (m.group("target").strip(),
                 _num(m.group("value")), m.group("field").strip())
 
+    # --- Pattern C: VERB-LEADING with target in a preposition tail ---
     m = re.match(
         rf"^\s*{PRICE_VERBS}\s+(?P<field>[a-z][a-z0-9 _\-]*?)\s+"
         rf"\$?\s*(?P<value>[\d,]+(?:\.\d+)?)\s+"
@@ -581,6 +661,7 @@ def _parse_price_command(msg: str):
             return (m.group("target").strip(),
                     _num(m.group("value")), field)
 
+    # --- Pattern D: TARGET-LEADING, verb-less ---
     m = re.match(
         rf"^\s*(?:to\s+)?(?P<target>.+?)\s+"
         rf"{PRICE_VERBS}\s+(?:a\s+|the\s+)?"
@@ -594,6 +675,7 @@ def _parse_price_command(msg: str):
         if re.match(r"^[a-z][a-z0-9 _\-]{1,30}$", field, re.I):
             return target, _num(m.group("value")), field
 
+    # --- Pattern E: "<target> <field> <value>" (verb-less, no "to") ---
     m = re.match(
         rf"^\s*(?:to\s+)?(?P<target>.+?)\s+"
         rf"(?P<field>[a-z][a-z0-9 _\-]*?)\s+"
@@ -608,6 +690,7 @@ def _parse_price_command(msg: str):
         if re.match(r"^[a-z][a-z0-9 _\-]{1,30}$", field, re.I):
             return target, _num(m.group("value")), field
 
+    # --- Pattern F: "<target> @ <value>" ---
     m = re.match(
         r"^\s*(?:to\s+)?(?P<target>.+?)\s*@\s*\$?\s*"
         r"(?P<value>[\d,]+(?:\.\d+)?)\s*$",
@@ -1068,6 +1151,7 @@ COLUMN_NOUN_ALIASES = {
     "pack rate": "Pack Rate",
     "length": "Length",
     "size": "Size",
+    "cm": "cm",
     "colour": "Color",
     "color": "Color",
     "variety": "Variety",
@@ -1186,7 +1270,99 @@ def _create_or_compute_column(items, columns, label, source_noun=None):
 
 
 # ===========================================================================
-#  REMOVE / RENAME / SORT
+#  RENAME / REPLACE / USE-AS  (v28 — full coverage)
+# ===========================================================================
+def _rename_column(items, columns, msg):
+    """
+    Handles all the phrasings:
+      rename X to Y
+      rename X as Y
+      rename the column X to Y
+      change X to Y
+      change the name of X to Y
+      replace X with Y
+      replace the column name X with Y
+      use X as Y
+      use X for Y
+      in X use Y
+      call X Y
+      label X as Y
+      set X as Y      (rename form, not price form)
+    """
+    low = _norm(msg)
+
+    # Strip leading "please" / "can you" noise
+    low = re.sub(r"^(?:please|can you|could you|kindly)\s+", "", low)
+
+    # Try each pattern in order; return on the first match that resolves.
+    patterns = [
+        # rename X to Y  |  rename X as Y  |  rename the column X to Y
+        r"^(?:re)?name\s+(?:the\s+)?(?:column\s+|field\s+)?"
+        r"(?P<old>.+?)\s+(?:to|as)\s+(?P<new>.+?)\s*$",
+
+        # replace X with Y  |  replace the column name X with Y
+        r"^replace\s+(?:the\s+)?(?:column\s+)?(?:name\s+)?"
+        r"(?P<old>.+?)\s+(?:with|by|as)\s+(?P<new>.+?)\s*$",
+
+        # change X to Y  |  change the name of X to Y
+        r"^change\s+(?:the\s+)?(?:name\s+of\s+)?(?:column\s+)?"
+        r"(?P<old>.+?)\s+(?:to|as|into)\s+(?P<new>.+?)\s*$",
+
+        # use X as Y  |  use X for Y
+        r"^use\s+(?:the\s+)?(?:column\s+)?"
+        r"(?P<old>.+?)\s+(?:as|for)\s+(?P<new>.+?)\s*$",
+
+        # in X use Y
+        r"^in\s+(?P<old>.+?)\s+use\s+(?P<new>.+?)\s*$",
+
+        # call X Y  |  call column X Y
+        r"^call\s+(?:the\s+)?(?:column\s+)?"
+        r"(?P<old>.+?)\s+(?P<new>[a-z0-9 _\-]+)\s*$",
+
+        # label X as Y
+        r"^label\s+(?:the\s+)?(?:column\s+)?"
+        r"(?P<old>.+?)\s+(?:as|to)\s+(?P<new>.+?)\s*$",
+    ]
+
+    for pat in patterns:
+        m = re.match(pat, low)
+        if not m:
+            continue
+        old_needle = (m.group("old") or "").strip()
+        new_label = (m.group("new") or "").strip()
+        if not old_needle or not new_label:
+            continue
+
+        col, _ = resolve_column(columns, old_needle)
+        if not col:
+            # If it's the "use X as Y" form where X wasn't a known column,
+            # try to match a role alias for X to produce a helpful message.
+            continue
+
+        new_label = _smart_column_label(new_label)
+        new_cols = []
+        for c in columns:
+            if c["key"] == col["key"]:
+                # Also update the role if the new label maps cleanly
+                new_role = col.get("role")
+                if _norm(new_label) in ("unit price", "price", "rate", "cost"):
+                    new_role = "unit_price"
+                elif _norm(new_label) in ("line total", "total", "amount",
+                                          "revenue"):
+                    new_role = "total"
+                elif _norm(new_label) in ("qty", "quantity", "stems"):
+                    new_role = "quantity"
+                new_cols.append({**c, "label": new_label, "role": new_role})
+            else:
+                new_cols.append(c)
+        return _ok(items, new_cols,
+                   f"Renamed “{col['label']}” to “{new_label}”.")
+
+    return None
+
+
+# ===========================================================================
+#  REMOVE / SORT / ROUND / DISCOUNT
 # ===========================================================================
 def _remove_row(items, columns, msg):
     m = re.search(r"\b(?:remove|delete|drop)\s+row\s+(\d+)", msg, re.I)
@@ -1278,31 +1454,6 @@ def _remove_rows(items, columns, msg):
                    f"Removed {removed} row(s) where {col['label']} is "
                    f"“{val}”.")
     return None
-
-
-def _rename_column(items, columns, msg):
-    m = re.search(
-        r"\brename\s+(?:the\s+)?([a-z0-9 _\-]+?)\s+(?:column\s+)?"
-        r"(?:to|as)\s+([a-z0-9 _\-]+)", _norm(msg))
-    if not m:
-        m = re.search(
-            r"\bchange\s+(?:the\s+)?(?:name\s+of\s+)?([a-z0-9 _\-]+?)\s+"
-            r"(?:to|as)\s+([a-z0-9 _\-]+)", _norm(msg))
-        if not m:
-            return None
-    old_needle, new_label = m.group(1).strip(), m.group(2).strip()
-    col, _ = resolve_column(columns, old_needle)
-    if not col:
-        return None
-    new_label = new_label.strip()
-    new_cols = []
-    for c in columns:
-        if c["key"] == col["key"]:
-            new_cols.append({**c, "label": new_label})
-        else:
-            new_cols.append(c)
-    return _ok(items, new_cols,
-               f"Renamed “{col['label']}” to “{new_label}”.")
 
 
 def _sort(items, columns, msg):
@@ -1401,10 +1552,12 @@ def _single_command(items, columns, msg):
     if not low:
         return None
 
+    # Read-cell queries MUST come before any other match
     r = _handle_read_cell(items, columns, msg)
     if r:
         return r
 
+    # Totals shorthand
     if re.search(r"\b(?:calculate|recalculate|compute)\s+(?:all\s+)?"
                  r"(?:line\s+)?totals?\b", low) \
        or low in {"calculate totals", "recalculate totals",
@@ -1416,14 +1569,23 @@ def _single_command(items, columns, msg):
                "what is the total", "how much is the total"}:
         return _grand_total(items, columns)
 
+    # Duplicates
     if re.search(r"\b(?:remove|delete|drop)\s+"
                  r"(?:all\s+)?duplicates?\b", low):
         return _remove_duplicates(items, columns, msg)
 
+    # Rename / replace / use-as  (v28 — before column creation so
+    # "use cm as unit price" doesn't get misinterpreted as add-column)
+    r = _rename_column(items, columns, msg)
+    if r:
+        return r
+
+    # Column creation
     r = _handle_column_creation(items, columns, msg)
     if r:
         return r
 
+    # Row / column removal
     r = _remove_row(items, columns, msg)
     if r: return r
     r = _remove_column(items, columns, msg)
@@ -1431,30 +1593,35 @@ def _single_command(items, columns, msg):
     r = _remove_rows(items, columns, msg)
     if r: return r
 
+    # Add row
     r = _add_row(items, columns, msg)
     if r: return r
 
-    r = _rename_column(items, columns, msg)
-    if r: return r
-
+    # Set value (price)
     r = _set_value(items, columns, msg)
     if r: return r
 
+    # Aggregate
     r = _aggregate(items, columns, msg)
     if r: return r
 
+    # Compute
     r = _compute(items, columns, msg)
     if r: return r
 
+    # Discount / increase
     r = _discount_or_increase(items, columns, msg)
     if r: return r
 
+    # Sort
     r = _sort(items, columns, msg)
     if r: return r
 
+    # Round
     r = _round(items, columns, msg)
     if r: return r
 
+    # Questions
     r = _answer_question(items, columns, msg)
     if r: return r
 
@@ -1470,7 +1637,8 @@ def _split_commands(msg: str) -> List[str]:
     for line in raw_lines:
         is_standalone = bool(re.search(
             r"\b(?:add|set|change|remove|delete|drop|create|make|"
-            r"calculate|compute|sort|rename|apply|update|reset|clear)\b",
+            r"calculate|compute|sort|rename|replace|apply|update|"
+            r"use|call|label|reset|clear)\b",
             line, re.I))
         if merged and not is_standalone:
             merged[-1] = merged[-1] + " " + line
