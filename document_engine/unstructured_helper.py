@@ -19,7 +19,7 @@ except Exception as _e:
     UNSTRUCTURED_AVAILABLE = False
     partition = None
     Table = Title = ListItem = NarrativeText = None
-    log.warning(f"Unstructured not available: {_e}")
+    log.warning(f"Unstructured not available (will use native engines): {_e}")
 
 
 def is_available() -> bool:
