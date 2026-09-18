@@ -241,7 +241,6 @@ def build_columns(headers: List[Any]) -> List[Dict[str, Any]]:
             "source": "original",
         })
 
-    # Resolve role collisions
     role_groups: Dict[str, List[Dict[str, Any]]] = {}
     for c in cols:
         if c["role"]:
