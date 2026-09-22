@@ -1,3 +1,7 @@
+# ============================================================================
+#  render.yaml  —  Altech Smart Document Intelligence Engine v27.1
+#  Blueprint for Render.com (free tier)
+# ============================================================================
 services:
   - type: web
     name: smart-document-engine
@@ -6,7 +10,16 @@ services:
     plan: free
     healthCheckPath: /api/ping
     dockerfilePath: ./Dockerfile
+
+    # Auto-deploy on push (change to false if you prefer manual deploys)
+    autoDeploy: true
+
+    # ---------------------------------------------------------------------
+    #  Environment variables
+    #  Core engine limits
+    # ---------------------------------------------------------------------
     envVars:
+      # --- Core engine limits ---
       - key: MAX_UPLOAD_MB
         value: "25"
       - key: MAX_PDF_PAGES
@@ -19,3 +32,37 @@ services:
         value: "0.84"
       - key: CORS_ORIGINS
         value: "*"
+
+      # --- Row / sheet caps (used by excel ingestion) ---
+      - key: MAX_ROWS
+        value: "20000"
+      - key: MAX_SHEETS
+        value: "50"
+
+      # --- Web lookup (DuckDuckGo instant answer) ---
+      - key: WEB_LOOKUP_ENABLED
+        value: "1"
+      - key: WEB_LOOKUP_TIMEOUT
+        value: "6"
+
+      # --- Tesseract ---
+      - key: TESSERACT_CMD
+        value: "/usr/bin/tesseract"
+
+      # --- Open-source document tools (iLovePDF-style) ---
+      - key: TOOLS_MAX_FILE_MB
+        value: "15"
+      - key: SOFFICE_BIN
+        value: "soffice"
+      - key: SOFFICE_TIMEOUT
+        value: "120"
+
+      # --- Secrets (set these in the Render dashboard, do NOT commit) ---
+      # PYTHON_API_KEY: the shared secret your PHP site sends in X-API-Key
+      - key: PYTHON_API_KEY
+        sync: false
+      # Optional AI provider keys used by chat_engine (if wired)
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
