@@ -1,0 +1,10 @@
+# NEW open-source dependencies for the tools engine.
+# Add these lines to your EXISTING requirements.txt (append, don't replace).
+
+pypdf>=4.0.0
+pdf2docx>=0.5.8
+PyMuPDF>=1.24.0
+reportlab>=4.0.0
+Pillow>=10.0.0
+pytesseract>=0.3.10
+img2pdf>=0.5.0
